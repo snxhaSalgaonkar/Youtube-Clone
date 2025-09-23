@@ -1,0 +1,15 @@
+{
+  "name": "clone",
+  "version": "1.0.0",
+  "description": "This project is made to learn backend using moongose ",
+  "keywords": [
+    "Sneha"
+  ],
+  "license": "ISC",
+  "author": "Sneha Salgaonkar",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
