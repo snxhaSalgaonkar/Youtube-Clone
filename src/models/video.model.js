@@ -76,23 +76,7 @@ const videoSchema = new Schema(
       min: 0,
     },
 
-    // ─── PROCESSING STATUS ────────────────────────────────────────────────────
 
-    /**
-     * KEY CONCEPT: Enum (Enumerated Values)
-     * Restricts the field to a fixed set of valid strings.
-     * This prevents typos like "Pending" or "READY" from sneaking into your DB.
-     *
-     * Video processing lifecycle:
-     *   pending → (upload complete, job queued)
-     *   processing → (FFmpeg/transcoder working)
-     *   ready → (HLS generated, video is watchable)
-     *   failed → (something went wrong, needs retry)
-     *
-     * SYSTEM FAILURE TIP: Always handle the "failed" state in your UI and
-     * have a retry/alert mechanism. Never let a video stay stuck in "processing"
-     * forever — set a timeout and move it to "failed" if it exceeds it.
-     */
     status: {
       type: String,
       enum: {
