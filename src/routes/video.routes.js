@@ -63,7 +63,7 @@ import {
   deleteVideo,
   getVideoById,
   getUserVideos,
-} from "../controllers/video.controller.extended.js";
+} from "../controllers/video2.controller.js";
 
 // ─── MULTER CONFIGURATION ─────────────────────────────────────────────────────
 
@@ -91,7 +91,12 @@ const storage = multer.diskStorage({
 
 // MIME type whitelist
 const fileFilter = (req, file, cb) => {
-  const allowedVideoTypes = ["video/mp4", "video/webm", "video/quicktime", "video/x-matroska"];
+  const allowedVideoTypes = [
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "video/x-matroska",
+  ];
   const allowedImageTypes = ["image/jpeg", "image/png", "image/webp"];
   const allowed = [...allowedVideoTypes, ...allowedImageTypes];
 
@@ -135,8 +140,8 @@ videoRouter.get("/count", optionalAuth, getVideoCount);
  *   GET /:videoId        ← wildcard, registered last ✅
  *   GET /:videoId/play   ← sub-route of wildcard, fine after parent ✅
  */
-videoRouter.get("/user/:userId", optionalAuth, getUserVideos);  // channel page
-videoRouter.get("/:videoId", optionalAuth, getVideoById);       // single video metadata
+videoRouter.get("/user/:userId", optionalAuth, getUserVideos); // channel page
+videoRouter.get("/:videoId", optionalAuth, getVideoById); // single video metadata
 videoRouter.get("/:videoId/play", optionalAuth, playVideo);
 videoRouter.get("/:videoId/link", optionalAuth, getVideoLink);
 videoRouter.get("/:videoId/likes/count", optionalAuth, getLikeCount);
@@ -152,10 +157,10 @@ videoRouter.post(
     { name: "videoFile", maxCount: 1 },
     { name: "thumbnail", maxCount: 1 },
   ]),
-  uploadVideo
+  uploadVideo,
 );
 videoRouter.patch("/:videoId", upload.single("thumbnail"), updateVideo);
-videoRouter.delete("/:videoId", deleteVideo);                   // ← NEW: delete video
+videoRouter.delete("/:videoId", deleteVideo); // ← NEW: delete video
 videoRouter.patch("/:videoId/publish", publishVideo);
 videoRouter.post("/:videoId/like", likeVideo);
 videoRouter.post("/:videoId/dislike", dislikeVideo);

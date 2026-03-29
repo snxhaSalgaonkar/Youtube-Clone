@@ -41,3 +41,25 @@ export const verifyJWT = asyncHandler(async (req, _, next) => {
     );
   }
 });
+
+/**
+ * MIDDLEWARE: optionalAuth
+ * Like verifyJWT but doesn't fail if no token is present.
+ * Use this for public endpoints that have "extra features" for logged-in users
+ * (e.g., showing a "liked" badge on a video if the user is logged in).
+ */
+export const optionalAuth = asyncHandler(async (req, _, next) => {
+  const token =
+    req.cookies?.accessToken ||
+    req.header("Authorization")?.replace("Bearer ", "");
+
+  if (token) {
+    try {
+      req.user = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+    } catch {
+      // Invalid token — treat as unauthenticated, don't throw
+      req.user = null;
+    }
+  }
+  next();
+});

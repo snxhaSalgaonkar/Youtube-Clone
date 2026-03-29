@@ -13,16 +13,17 @@
 
 import mongoose from "mongoose";
 import { Video } from "../models/video.model.js"; // your model from before
-import {
-  Like,
-  Dislike,
-  Comment,
-  Playlist,
-  WatchHistory,
-} from "../models/supporting.models.js";
-import { ApiError, ApiResponse } from "../utils/apiResponse.js";
-import asyncHandler from "../utils/asyncHandler.js";
-import { uploadToCloudinary } from "../utils/cloudinary.js"; // see note below
+// import {
+//   Like,
+//   Dislike,
+//   Comment,
+//   Playlist,
+//   WatchHistory,
+// } from "../models/supporting.models.js";
+import { ApiError } from "../utils/ApiError.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { uploadToCloudinary } from "../utils/cloudinary.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. UPLOAD / GENERATE A VIDEO
@@ -59,7 +60,7 @@ import { uploadToCloudinary } from "../utils/cloudinary.js"; // see note below
  * respond immediately with 201, and kick off processing as a background job
  * (Bull queue, AWS Lambda, Cloudinary auto-transforms, etc.).
  */
-export const uplwoadVideo = asyncHandler(async (req, res) => {
+export const uploadVideo = asyncHandler(async (req, res) => {
   // req.files is populated by Multer middleware (configured in the route)
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
