@@ -25,41 +25,6 @@ import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { uploadToCloudinary } from "../utils/cloudinary.js";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. UPLOAD / GENERATE A VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/videos/
- *
- * KEY CONCEPT: Multipart File Upload Pipeline
- * Raw binary files (video, thumbnail) come in as multipart/form-data.
- * Multer (an Express middleware) intercepts the request BEFORE your controller,
- * saves the file temporarily to disk (or memory), and attaches it to req.file
- * or req.files. Your controller then pushes that file to cloud storage
- * (Cloudinary, AWS S3) and saves only the resulting URL in MongoDB.
- *
- * Pipeline:
- *   Client → Express → Multer (temp file) → Controller → Cloudinary → MongoDB
- *
- * COMMON BEGINNER MISTAKE: Saving uploaded files to the server's local disk
- * permanently. This fails on cloud platforms (Heroku, Render, Railway) which
- * have ephemeral filesystems — files disappear on restart. Always push to
- * cloud storage and store only the URL.
- *
- * SECURITY TIPS:
- * 1. Validate MIME type server-side — never trust the file extension the user sends.
- *    A user can rename "malware.exe" to "video.mp4". Check the actual file bytes.
- * 2. Set a file size limit in Multer (e.g., 500MB for video).
- * 3. Sanitize the filename — strip special characters that could cause path
- *    traversal attacks (e.g., "../../../../etc/passwd").
- * 4. Only authenticated users should reach this endpoint (verifyJWT middleware).
- *
- * SYSTEM FAILURE TIP: Video processing (FFmpeg transcoding, HLS generation)
- * is CPU-heavy and can take minutes. Never do it synchronously in the controller.
- * Upload the raw file to cloud storage, create the DB record with status:"pending",
- * respond immediately with 201, and kick off processing as a background job
- * (Bull queue, AWS Lambda, Cloudinary auto-transforms, etc.).
- */
 export const uploadVideo = asyncHandler(async (req, res) => {
   // req.files is populated by Multer middleware (configured in the route)
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
@@ -122,25 +87,6 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     .json(new ApiResponse(201, video, "Video uploaded successfully"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. PUBLISH A VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * PATCH /api/v1/videos/:videoId/publish
- *
- * KEY CONCEPT: Authorization vs Authentication
- * Authentication = verifying WHO you are (JWT check).
- * Authorization  = verifying what you're ALLOWED to do.
- * Here: any logged-in user can upload, but only the VIDEO OWNER can publish it.
- *
- * COMMON BEGINNER MISTAKE: Only checking authentication but skipping
- * authorization. Without the owner check, any logged-in user could publish
- * (or delete!) someone else's video just by knowing its ID.
- *
- * SECURITY TIP: Always compare IDs as strings (.toString()) — MongoDB ObjectIds
- * are objects and === comparison on objects always returns false even if they
- * hold the same value.
- */
 export const publishVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -312,33 +258,6 @@ export const searchVideos = asyncHandler(async (req, res) => {
   );
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. LIKE A VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/videos/:videoId/like
- *
- * KEY CONCEPT: Idempotency
- * An idempotent operation produces the same result whether you call it once
- * or ten times. Liking a video you already liked should NOT add another like —
- * it should just confirm it's liked.
- *
- * We use findOneAndUpdate with upsert: true:
- * - If the Like document exists: do nothing (no-op)
- * - If it doesn't exist: create it
- * This is atomic — no race condition between check and insert.
- *
- * KEY CONCEPT: Mutual exclusion of like/dislike
- * When a user likes, remove any existing dislike first (in the same operation).
- * The order matters: delete dislike BEFORE creating like to avoid a brief
- * inconsistent state where both exist.
- *
- * SYSTEM FAILURE TIP: likeCount on the Video document is a cached counter.
- * Update it using $inc for atomicity. Do NOT do:
- *   video.likeCount = (await Like.countDocuments({video: id}))
- * That's two queries and a race condition — the count you read might be stale
- * by the time you save it.
- */
 export const likeVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -383,16 +302,6 @@ export const likeVideo = asyncHandler(async (req, res) => {
     .json(new ApiResponse(200, { liked: true }, "Video liked"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. DISLIKE A VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/videos/:videoId/dislike
- *
- * Mirror of likeVideo with mutual exclusion in the other direction.
- * Note: YouTube doesn't show public dislike counts (to protect creators),
- * but you might still want to store dislikes for recommendation algorithms.
- */
 export const dislikeVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -499,26 +408,8 @@ export const addComment = asyncHandler(async (req, res) => {
     .json(new ApiResponse(201, comment, "Comment added successfully"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. UPDATE VIDEO DETAILS
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * PATCH /api/v1/videos/:videoId
- *
- * KEY CONCEPT: Partial Updates with PATCH
- * PATCH means "update only the fields I send". PUT means "replace the entire
- * resource". For user-editable metadata (title, description, tags), always
- * use PATCH — you don't want to wipe fields the user didn't include.
- *
- * KEY CONCEPT: Dynamic update object
- * Build the update object only from fields that were actually sent.
- * If `title` isn't in the request body, don't include it in the update —
- * otherwise you'd overwrite it with undefined/null.
- *
- * COMMON BEGINNER MISTAKE: Doing video.title = req.body.title without
- * checking if req.body.title exists. This sets the field to undefined,
- * which may pass Mongoose validation (if not required) and corrupt your data.
- */
+// PATCH /api/v1/videos/:videoId
+
 export const updateVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -586,30 +477,7 @@ export const updateVideo = asyncHandler(async (req, res) => {
     .json(new ApiResponse(200, updatedVideo, "Video updated successfully"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. PLAY A VIDEO (GET VIDEO DETAILS + INCREMENT VIEW COUNT)
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * GET /api/v1/videos/:videoId/play
- *
- * KEY CONCEPT: Separating "read" from "side effects"
- * Playing a video does two things: (1) fetch the video data, (2) increment views.
- * The view increment should be fire-and-forget — don't make the user wait for
- * the DB write. Use setImmediate() to push it to the next event loop tick
- * so the response goes out immediately.
- *
- * KEY CONCEPT: Access Control for different visibility levels
- * - public:   anyone can watch
- * - unlisted: only people with the link (no auth required, but not in search)
- * - private:  only the owner
- *
- * SYSTEM FAILURE TIP: Serving video files directly from Express is catastrophically
- * inefficient. The videoFile URL should be a Cloudinary/S3 URL that the browser
- * fetches directly. Never stream gigabytes of video through your Node.js server.
- *
- * KEY CONCEPT: Resumable playback
- * Fetch the user's watch history entry to tell the player where to resume.
- */
+//GET /api/v1/videos/:videoId/play
 export const playVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -670,26 +538,7 @@ export const playVideo = asyncHandler(async (req, res) => {
   );
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 9. SAVE TO WATCH HISTORY (called when user starts watching)
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/videos/:videoId/history
- *
- * KEY CONCEPT: Upsert (Update or Insert)
- * findOneAndUpdate with { upsert: true } means:
- * - If a document matching the filter exists → update it
- * - If it doesn't exist → create it
- * This is atomic — no race condition, no duplicates, one round trip to MongoDB.
- *
- * Without upsert, you'd have to:
- * 1. find() — check if history exists
- * 2. if yes: update(); if no: create()
- * Those are two separate DB calls with a window for duplicate inserts in between.
- *
- * PERFORMANCE TIP: This is called frequently (on every video open). Ensure the
- * compound index on { user, video } exists (set in the model) so the lookup is O(log n).
- */
+//POST /api/v1/videos/:videoId/history
 export const saveToWatchHistory = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
