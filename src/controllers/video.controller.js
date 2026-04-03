@@ -1,32 +1,58 @@
 /**
  * VIDEO CONTROLLER — YouTube Clone
- * All 17 feature methods with full explanations, security notes, and beginner tips.
  *
- * KEY CONCEPT: Controller vs Route vs Model
- * - Model:      Defines the data shape and talks to MongoDB.
- * - Controller: Contains the business logic (what to DO with the data).
- * - Route:      Maps HTTP methods + URLs to the right controller function.
+ * ARCHITECTURE NOTE:
+ * Controllers are the bridge between your routes and business logic.
+ * They should NOT contain raw DB queries — that belongs in a service layer
+ * in production. For learning purposes, we keep queries here, but in a
+ * real production codebase you'd separate concerns further:
+ *   Route → Controller → Service → Repository (DB layer)
  *
- * Controllers should NEVER contain raw mongoose queries sprawled everywhere.
- * Keep models thin (schema + indexes), controllers focused on one job each.
+ * Every controller here is wrapped in asyncHandler — this catches any
+ * thrown errors and passes them to your global error handler middleware
+ * automatically. Without it, an unhandled Promise rejection crashes Node.
  */
 
 import mongoose from "mongoose";
-import { Video } from "../models/video.model.js"; // your model from before
-// import {
-//   Like,
-//   Dislike,
-//   Comment,
-//   Playlist,
-//   WatchHistory,
-// } from "../models/supporting.models.js";
+import { Video } from "../models/video.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { uploadToCloudinary } from "../utils/cloudinary.js";
+import {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+} from "../utils/cloudinary.js";
+import {
+  generateHLSUrl,
+  extractVideoDuration,
+  buildSearchQuery,
+  buildPaginationOptions,
+} from "../utils/videoUtils.js";
 
+// ─── 1. UPLOAD VIDEO ──────────────────────────────────────────────────────────
+
+/**
+ * WHAT HAPPENS HERE (production pipeline):
+ * 1. Multer receives the multipart/form-data request and buffers the file.
+ * 2. We upload to Cloudinary (or S3 in large systems).
+ * 3. We extract the duration from the uploaded file metadata.
+ * 4. We create a DB record with status "pending" — the video isn't live yet.
+ * 5. A background job (worker/queue) picks this up, transcodes it to multiple
+ *    resolutions, generates HLS segments, and updates status to "ready".
+ *
+ * BEGINNER MISTAKE: Blocking the main thread with FFmpeg transcoding inside
+ * the request handler. FFmpeg can take minutes. The HTTP connection will time
+ * out and the user gets a 504. Always offload heavy work to a job queue
+ * (BullMQ, RabbitMQ, AWS SQS etc.).
+ *
+ * BEGINNER MISTAKE: Storing the file path on your own server disk permanently.
+ * When you scale to multiple server instances, only one server has that file.
+ * Use object storage (Cloudinary, S3, GCS) — it's shared across all instances.
+ */
 export const uploadVideo = asyncHandler(async (req, res) => {
-  // req.files is populated by Multer middleware (configured in the route)
+  const { title, description, tags, category, visibility } = req.body;
+
+  // req.files is populated by multer middleware
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
 
@@ -37,948 +63,879 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Thumbnail is required");
   }
 
-  const { title, description, category, tags, visibility } = req.body;
-
-  if (!title?.trim()) {
-    throw new ApiError(400, "Title is required");
-  }
-
-  // Upload both files to Cloudinary in parallel
-  // KEY CONCEPT: Promise.all() runs async tasks concurrently, not sequentially.
-  // Running them one after the other would take 2× as long for no reason.
+  // Upload both files to Cloudinary concurrently — don't await sequentially,
+  // that wastes time. Promise.all runs them in parallel.
   const [videoUpload, thumbnailUpload] = await Promise.all([
     uploadToCloudinary(videoLocalPath, "video"),
     uploadToCloudinary(thumbnailLocalPath, "image"),
   ]);
 
   if (!videoUpload?.url) {
-    throw new ApiError(500, "Video upload failed — please try again");
+    throw new ApiError(500, "Video upload failed. Please try again.");
+  }
+  if (!thumbnailUpload?.url) {
+    throw new ApiError(500, "Thumbnail upload failed. Please try again.");
   }
 
-  // Parse tags: accept either a JSON array or a comma-separated string
-  // COMMON BEGINNER MISTAKE: Assuming the client always sends the right format.
-  let parsedTags = [];
-  if (tags) {
-    parsedTags = Array.isArray(tags)
-      ? tags
-      : tags
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean);
-  }
+  // Extract video duration from Cloudinary metadata (or use FFmpeg locally)
+  const duration = await extractVideoDuration(videoUpload);
+
+  // Generate HLS URL from the Cloudinary public_id
+  // HLS = HTTP Live Streaming. Cloudinary can serve adaptive bitrate streams
+  // automatically if you're on a paid plan. Otherwise you'd run FFmpeg yourself.
+  const hlsUrl = generateHLSUrl(videoUpload.public_id);
 
   const video = await Video.create({
     owner: req.user._id,
     videoFile: videoUpload.url,
-    thumbnail: thumbnailUpload?.url || "",
-    hlsUrl: videoUpload.eager?.[0]?.url || null, // Cloudinary eager transform for HLS
+    hlsUrl,
+    thumbnail: thumbnailUpload.url,
     title: title.trim(),
     description: description?.trim() || "",
-    duration: videoUpload.duration || 0, // Cloudinary returns duration for videos
-    category: category?.trim() || "General",
-    tags: parsedTags,
-    visibility: visibility || "private", // default PRIVATE — explicit publish step required
-    status: "ready", // in a real system, set "pending" and use a background worker
+    duration,
+    tags: tags ? JSON.parse(tags) : [],
+    category: category || "General",
+    visibility: visibility || "private",
+    status: "pending", // Not ready until processing completes
+    isPublished: false,
   });
-  console.log("*********** Video uploaded succesfully" + video);
 
   return res
     .status(201)
-    .json(new ApiResponse(201, video, "Video uploaded successfully"));
+    .json(
+      new ApiResponse(
+        201,
+        video,
+        "Video uploaded successfully. Processing will begin shortly.",
+      ),
+    );
 });
 
+// ─── 2. PUBLISH VIDEO ─────────────────────────────────────────────────────────
+
+/**
+ * Publishing = making the video publicly visible.
+ * We check status first — you can't publish a video that hasn't finished
+ * processing. Showing a half-transcoded video to users = broken experience.
+ *
+ * SECURITY: verifyOwnership middleware already confirmed this user owns the
+ * video before this function runs. Never re-check ownership inside controllers
+ * — that's the middleware's job. Single Responsibility Principle.
+ */
 export const publishVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
   const video = await Video.findById(videoId);
-
   if (!video) {
     throw new ApiError(404, "Video not found");
   }
 
-  // Authorization check: only the owner can publish
-  if (video.owner.toString() !== req.user._id.toString()) {
-    throw new ApiError(403, "Forbidden: You do not own this video");
-  }
-
-  // Only publish if the video has been processed
   if (video.status !== "ready") {
-    throw new ApiError(400, `Cannot publish — video is still ${video.status}`);
+    throw new ApiError(
+      400,
+      `Cannot publish video with status "${video.status}". Video must finish processing first.`,
+    );
   }
 
-  video.isPublished = true;
-  video.visibility = "public";
-  await video.save();
+  // instance method defined on the schema — keeps publish logic in one place
+  const updatedVideo = await video.publish();
 
   return res
     .status(200)
-    .json(new ApiResponse(200, video, "Video published successfully"));
+    .json(new ApiResponse(200, updatedVideo, "Video published successfully"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. SEARCH VIDEOS
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── 3. UPDATE VIDEO DETAILS ──────────────────────────────────────────────────
+
 /**
- * GET /api/v1/videos/search?q=javascript&page=1&limit=20&category=Tech&sort=views
+ * BEGINNER MISTAKE: Doing a full document replace with .save() when you only
+ * need to update 2 fields. Use findByIdAndUpdate with $set for partial updates.
+ * This is atomic and won't accidentally wipe fields you didn't send.
  *
- * KEY CONCEPT: MongoDB Full-Text Search with $text
- * When you create a text index on title + description (done in the video model),
- * MongoDB can search for words across both fields in a single query.
- * $text: { $search: "javascript tutorial" } finds all videos containing those words.
- *
- * KEY CONCEPT: Pagination (skip + limit)
- * Never return ALL documents in one query — for a large collection, that would
- * load millions of records into memory and crash the server.
- * - limit: how many results per page (e.g., 20)
- * - skip: how many to skip = (page - 1) × limit
- *
- * KEY CONCEPT: Aggregation Pipeline for complex queries
- * We use aggregation here instead of find() because we need to:
- * 1. Filter ($match)
- * 2. Lookup owner details ($lookup — like a SQL JOIN)
- * 3. Sort by multiple fields ($sort)
- * 4. Paginate ($skip + $limit)
- * 5. Count total results for "page X of Y" UI ($facet)
- *
- * SECURITY TIP: Sanitize the search query — strip regex special characters
- * to prevent ReDoS (Regular Expression Denial of Service) attacks.
- * Never pass unsanitized user input directly to $regex queries.
- *
- * COMMON BEGINNER MISTAKE: Returning all fields including sensitive ones.
- * Use $project to whitelist only the fields the client needs.
+ * BEGINNER MISTAKE: Allowing users to update sensitive fields like `owner`,
+ * `status`, `views`, `likeCount` through this endpoint. Always whitelist
+ * exactly which fields the user is allowed to change.
  */
-export const searchVideos = asyncHandler(async (req, res) => {
-  const {
-    q = "",
-    page = 1,
-    limit = 20,
-    category,
-    sort = "createdAt", // createdAt | views | likeCount
-    order = "desc",
-  } = req.query;
-
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.min(50, Math.max(1, parseInt(limit))); // cap at 50 per page
-  const skip = (pageNum - 1) * limitNum;
-
-  // Base filter: only show public, ready, published videos to everyone
-  const matchStage = {
-    visibility: "public",
-    status: "ready",
-    isPublished: true,
-  };
-
-  if (q.trim()) {
-    // $text search uses the compound text index on title + description
-    matchStage.$text = { $search: q.trim() };
-  }
-
-  if (category) {
-    matchStage.category = category;
-  }
-
-  const sortOrder = order === "asc" ? 1 : -1;
-  const sortStage = { [sort]: sortOrder };
-  // When using $text search, also sort by text relevance score
-  if (q.trim()) {
-    sortStage.score = { $meta: "textScore" };
-  }
-
-  /**
-   * KEY CONCEPT: $facet — run two pipelines in parallel
-   * One pipeline gets the paginated results, the other counts the total.
-   * Without $facet you'd need two separate DB queries.
-   */
-  const pipeline = [
-    { $match: matchStage },
-    // Add text relevance score field (only has value when $text is used)
-    ...(q.trim() ? [{ $addFields: { score: { $meta: "textScore" } } }] : []),
-    { $sort: sortStage },
-    {
-      $facet: {
-        // Branch 1: paginated results
-        results: [
-          { $skip: skip },
-          { $limit: limitNum },
-          {
-            // $lookup = LEFT JOIN — fetches owner's username and avatar
-            $lookup: {
-              from: "users",
-              localField: "owner",
-              foreignField: "_id",
-              as: "owner",
-              pipeline: [
-                { $project: { username: 1, avatar: 1, _id: 1 } }, // only safe fields
-              ],
-            },
-          },
-          { $unwind: "$owner" }, // converts owner array (from lookup) to single object
-          {
-            $project: {
-              title: 1,
-              thumbnail: 1,
-              duration: 1,
-              views: 1,
-              likeCount: 1,
-              owner: 1,
-              createdAt: 1,
-              category: 1,
-            },
-          },
-        ],
-        // Branch 2: total count for pagination UI
-        totalCount: [{ $count: "count" }],
-      },
-    },
-  ];
-
-  const [result] = await Video.aggregate(pipeline);
-
-  const total = result.totalCount[0]?.count || 0;
-
-  return res.status(200).json(
-    new ApiResponse(
-      200,
-      {
-        videos: result.results,
-        pagination: {
-          total,
-          page: pageNum,
-          limit: limitNum,
-          totalPages: Math.ceil(total / limitNum),
-          hasNextPage: pageNum < Math.ceil(total / limitNum),
-        },
-      },
-      "Search results",
-    ),
-  );
-});
-
-export const likeVideo = asyncHandler(async (req, res) => {
+export const updateVideoDetails = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
+  const { title, description, tags, category, visibility } = req.body;
 
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const videoExists = await Video.exists({ _id: videoId });
-  if (!videoExists) throw new ApiError(404, "Video not found");
-
-  // Check if already liked
-  const existingLike = await Like.findOne({
-    user: req.user._id,
-    video: videoId,
-  });
-
-  if (existingLike) {
-    // Toggle off: remove like
-    await Like.deleteOne({ _id: existingLike._id });
-    await Video.findByIdAndUpdate(videoId, { $inc: { likeCount: -1 } });
-
-    return res
-      .status(200)
-      .json(new ApiResponse(200, { liked: false }, "Like removed"));
-  }
-
-  // Remove any existing dislike first (mutual exclusion)
-  const existingDislike = await Dislike.findOneAndDelete({
-    user: req.user._id,
-    video: videoId,
-  });
-
-  // Create the like
-  await Like.create({ user: req.user._id, video: videoId });
-
-  // Atomically update the cached counter(s)
-  const update = { $inc: { likeCount: 1 } };
-  await Video.findByIdAndUpdate(videoId, update);
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, { liked: true }, "Video liked"));
-});
-
-export const dislikeVideo = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const videoExists = await Video.exists({ _id: videoId });
-  if (!videoExists) throw new ApiError(404, "Video not found");
-
-  const existingDislike = await Dislike.findOne({
-    user: req.user._id,
-    video: videoId,
-  });
-
-  if (existingDislike) {
-    // Toggle off
-    await Dislike.deleteOne({ _id: existingDislike._id });
-    return res
-      .status(200)
-      .json(new ApiResponse(200, { disliked: false }, "Dislike removed"));
-  }
-
-  // Remove any existing like (mutual exclusion)
-  const existingLike = await Like.findOneAndDelete({
-    user: req.user._id,
-    video: videoId,
-  });
-  if (existingLike) {
-    await Video.findByIdAndUpdate(videoId, { $inc: { likeCount: -1 } });
-  }
-
-  await Dislike.create({ user: req.user._id, video: videoId });
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, { disliked: true }, "Video disliked"));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. COMMENT ON A VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/videos/:videoId/comments
- *
- * KEY CONCEPT: Input Validation and Sanitization
- * Before touching the database:
- * 1. Validate: is the required data present and the right type?
- * 2. Sanitize: remove/escape any potentially harmful content.
- *
- * SECURITY TIP: Comment text can contain HTML. If you ever render it in a
- * browser without escaping, you get XSS (Cross-Site Scripting) — the comment
- * might contain <script>steal_cookies()</script>. Either:
- * a) Strip all HTML tags server-side (use the 'sanitize-html' npm package)
- * b) Or always escape on the frontend (React does this automatically with JSX)
- *
- * SYSTEM FAILURE TIP: Rate-limit this endpoint. Without a rate limit,
- * a bot can post thousands of comments per second. Use express-rate-limit or
- * a Redis-based limiter (e.g., 10 comments per minute per user).
- */
-export const addComment = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-  const { text, parentCommentId } = req.body;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  if (!text?.trim()) {
-    throw new ApiError(400, "Comment text is required");
-  }
-
-  if (text.trim().length > 2000) {
-    throw new ApiError(400, "Comment cannot exceed 2000 characters");
-  }
-
-  const video = await Video.findById(videoId).select("_id status visibility");
-  if (!video || video.status !== "ready") {
-    throw new ApiError(404, "Video not found or not available");
-  }
-
-  // If replying to a comment, verify the parent exists
-  if (parentCommentId && !mongoose.isValidObjectId(parentCommentId)) {
-    throw new ApiError(400, "Invalid parent comment ID");
-  }
-
-  const comment = await Comment.create({
-    video: videoId,
-    author: req.user._id,
-    text: text.trim(),
-    parent: parentCommentId || null,
-  });
-
-  // Increment cached comment count only for top-level comments
-  if (!parentCommentId) {
-    await Video.findByIdAndUpdate(videoId, { $inc: { commentCount: 1 } });
-  }
-
-  // Populate author info before returning (so the client gets username/avatar)
-  await comment.populate("author", "username avatar");
-
-  return res
-    .status(201)
-    .json(new ApiResponse(201, comment, "Comment added successfully"));
-});
-
-// PATCH /api/v1/videos/:videoId
-
-export const updateVideo = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const video = await Video.findById(videoId);
-  if (!video) throw new ApiError(404, "Video not found");
-
-  // Authorization
-  if (video.owner.toString() !== req.user._id.toString()) {
-    throw new ApiError(403, "Forbidden: You do not own this video");
-  }
-
-  const { title, description, category, tags, visibility } = req.body;
-
-  // Build update object with only present fields (PATCH semantics)
+  // Build update object with only provided fields (partial update)
   const updateFields = {};
-  if (title !== undefined) {
-    if (!title.trim()) throw new ApiError(400, "Title cannot be empty");
-    updateFields.title = title.trim();
-  }
+  if (title !== undefined) updateFields.title = title.trim();
   if (description !== undefined) updateFields.description = description.trim();
-  if (category !== undefined) updateFields.category = category.trim();
-  if (visibility !== undefined) {
-    const validVisibilities = ["public", "unlisted", "private"];
-    if (!validVisibilities.includes(visibility)) {
-      throw new ApiError(400, "Invalid visibility value");
-    }
-    updateFields.visibility = visibility;
-  }
-  if (tags !== undefined) {
-    updateFields.tags = Array.isArray(tags)
-      ? tags
-      : tags
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean);
+  if (tags !== undefined) updateFields.tags = tags;
+  if (category !== undefined) updateFields.category = category;
+  if (visibility !== undefined) updateFields.visibility = visibility;
+
+  if (Object.keys(updateFields).length === 0) {
+    throw new ApiError(400, "No valid fields provided for update");
   }
 
-  // Handle optional new thumbnail upload
-  if (req.file?.path) {
-    const thumbnailUpload = await uploadToCloudinary(req.file.path, "image");
+  // Handle optional thumbnail replacement
+  const thumbnailLocalPath = req.file?.path;
+  if (thumbnailLocalPath) {
+    const thumbnailUpload = await uploadToCloudinary(
+      thumbnailLocalPath,
+      "image",
+    );
     if (!thumbnailUpload?.url) {
       throw new ApiError(500, "Thumbnail upload failed");
     }
-    updateFields.thumbnail = thumbnailUpload.url;
-    // IMPORTANT: In production, also DELETE the old thumbnail from Cloudinary
-    // to avoid orphaned storage costs. Use cloudinary.uploader.destroy(publicId).
-  }
 
-  if (Object.keys(updateFields).length === 0) {
-    throw new ApiError(400, "No update fields provided");
+    // Delete the old thumbnail from Cloudinary to avoid orphaned files
+    // piling up and eating your storage quota.
+    const oldVideo = await Video.findById(videoId).select("thumbnail");
+    if (oldVideo?.thumbnail) {
+      // Extract public_id from the Cloudinary URL to delete it
+      const publicId = oldVideo.thumbnail.split("/").pop().split(".")[0];
+      await deleteFromCloudinary(publicId, "image");
+    }
+
+    updateFields.thumbnail = thumbnailUpload.url;
   }
 
   const updatedVideo = await Video.findByIdAndUpdate(
     videoId,
     { $set: updateFields },
-    { new: true, runValidators: true }, // runValidators re-runs schema validators on update
-  );
+    { new: true, runValidators: true }, // runValidators re-runs schema validation on update
+  ).select("-__v");
+
+  if (!updatedVideo) {
+    throw new ApiError(404, "Video not found");
+  }
 
   return res
     .status(200)
     .json(new ApiResponse(200, updatedVideo, "Video updated successfully"));
 });
 
-//GET /api/v1/videos/:videoId/play
-export const playVideo = asyncHandler(async (req, res) => {
+// ─── 4. DELETE VIDEO ──────────────────────────────────────────────────────────
+
+/**
+ * PRODUCTION PATTERN: Soft delete vs Hard delete.
+ * Hard delete: permanently removes from DB. You lose analytics, audit trails.
+ * Soft delete: set a `deletedAt` timestamp, filter it out of queries.
+ *   Allows recovery. YouTube likely uses soft delete — deleted videos can
+ *   sometimes be restored.
+ * For simplicity, we do hard delete here, but add an `isDeleted` flag in
+ * production.
+ *
+ * CRITICAL: Always delete the file from storage AFTER the DB record is removed.
+ * If DB delete fails, throw an error — don't delete files for a record that
+ * still exists. Orphaned DB records are worse than orphaned files.
+ */
+export const deleteVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
+  const video = await Video.findById(videoId);
+  if (!video) {
+    throw new ApiError(404, "Video not found");
+  }
+
+  // Delete DB record first
+  await Video.findByIdAndDelete(videoId);
+
+  // Then clean up Cloudinary assets — these are async fire-and-forget in
+  // many production systems. If Cloudinary delete fails, the DB record is
+  // already gone, so no user impact — just a storage leak. Log it.
+  const videoPublicId = video.videoFile.split("/").pop().split(".")[0];
+  const thumbnailPublicId = video.thumbnail.split("/").pop().split(".")[0];
+
+  await Promise.allSettled([
+    deleteFromCloudinary(videoPublicId, "video"),
+    deleteFromCloudinary(thumbnailPublicId, "image"),
+  ]);
+  // allSettled (not all) — we don't want one failure to prevent the other deletion
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, null, "Video deleted successfully"));
+});
+
+// ─── 5. GET VIDEO BY ID ───────────────────────────────────────────────────────
+
+/**
+ * KEY CONCEPT: populate()
+ * When you store owner as an ObjectId reference, calling .populate("owner")
+ * makes Mongoose do a second DB query to fetch that User document and
+ * embed it inline. Think of it like a JOIN in SQL.
+ *
+ * PERFORMANCE: populate() runs an extra query. For high-traffic endpoints,
+ * use MongoDB $lookup aggregation instead — it's a single query.
+ *
+ * SECURITY: Always .select() the exact fields you want from the joined
+ * document. Never return the full User document — it has passwords (even hashed),
+ * emails, tokens etc.
+ */
+export const getVideoById = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(videoId)) {
+    throw new ApiError(400, "Invalid video ID format");
   }
 
   const video = await Video.findById(videoId)
-    .populate("owner", "username avatar subscribers")
+    .populate("owner", "username avatar subscriberCount")
     .select("-__v");
 
-  if (!video || video.status !== "ready") {
-    throw new ApiError(404, "Video not found or not available");
+  if (!video) {
+    throw new ApiError(404, "Video not found");
   }
 
-  // Access control based on visibility
-  if (video.visibility === "private") {
-    if (!req.user || video.owner._id.toString() !== req.user._id.toString()) {
-      throw new ApiError(403, "This video is private");
-    }
+  // Access control: private/unlisted videos are only visible to their owner
+  const isOwner = req.user && video.owner._id.equals(req.user._id);
+  if (!isOwner && video.visibility === "private") {
+    throw new ApiError(403, "This video is private");
   }
-
-  // Increment view count asynchronously — don't await, don't block the response
-  // KEY CONCEPT: setImmediate defers execution until after I/O events in the
-  // current event loop cycle. The client gets the response immediately.
-  setImmediate(() => {
-    Video.findByIdAndUpdate(videoId, { $inc: { views: 1 } }).catch(
-      console.error,
-    );
-  });
-
-  // Fetch resume position if user is logged in
-  let resumeAt = 0;
-  if (req.user) {
-    const history = await WatchHistory.findOne({
-      user: req.user._id,
-      video: videoId,
-    }).select("watchedSeconds");
-    resumeAt = history?.watchedSeconds || 0;
-  }
-
-  // Check if the current user has liked this video
-  let hasLiked = false;
-  if (req.user) {
-    hasLiked = !!(await Like.exists({ user: req.user._id, video: videoId }));
-  }
-
-  return res.status(200).json(
-    new ApiResponse(
-      200,
-      {
-        video,
-        resumeAt,
-        hasLiked,
-      },
-      "Video ready to play",
-    ),
-  );
-});
-
-//POST /api/v1/videos/:videoId/history
-export const saveToWatchHistory = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const historyEntry = await WatchHistory.findOneAndUpdate(
-    { user: req.user._id, video: videoId }, // filter
-    {
-      $set: {
-        lastWatchedAt: new Date(),
-        completed: false,
-      },
-      $setOnInsert: { watchedSeconds: 0 }, // only set on INSERT, not on UPDATE
-    },
-    { upsert: true, new: true },
-  );
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, historyEntry, "Added to watch history"));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 10. STOP / PAUSE VIDEO (save progress)
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * PATCH /api/v1/videos/:videoId/progress
- *
- * Called when the user pauses, stops, or closes a video.
- * Also called periodically while playing (every 30s) for crash recovery.
- *
- * KEY CONCEPT: Debouncing on the client
- * Don't call this on EVERY second of playback — that's 3600 DB writes per hour
- * per viewer. The frontend should debounce: save progress at most every 30
- * seconds and always on pause/close.
- *
- * KEY CONCEPT: $max operator — only update if the new value is LARGER
- * $max: { watchedSeconds: seconds } means "only advance the progress, never go back"
- * This prevents a seek-backwards from wiping out a user's furthest watch point.
- *
- * SECURITY: Validate that `seconds` is a number within the video's duration.
- * Never trust client-reported playback position without bounds checking.
- */
-export const savePlaybackProgress = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-  const { seconds } = req.body;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const secondsNum = parseFloat(seconds);
-  if (isNaN(secondsNum) || secondsNum < 0) {
-    throw new ApiError(400, "Invalid seconds value");
-  }
-
-  // Fetch duration for bounds checking
-  const video = await Video.findById(videoId).select("duration");
-  if (!video) throw new ApiError(404, "Video not found");
-
-  const clampedSeconds = Math.min(secondsNum, video.duration);
-  const isCompleted = clampedSeconds >= video.duration * 0.95; // 95% = "completed"
-
-  await WatchHistory.findOneAndUpdate(
-    { user: req.user._id, video: videoId },
-    {
-      $max: { watchedSeconds: clampedSeconds }, // only advance, never go back
-      $set: {
-        lastWatchedAt: new Date(),
-        completed: isCompleted,
-      },
-    },
-    { upsert: true },
-  );
-
-  // Fire and forget — client doesn't need to wait for acknowledgment
-  return res
-    .status(200)
-    .json(
-      new ApiResponse(
-        200,
-        { watchedSeconds: clampedSeconds, isCompleted },
-        "Progress saved",
-      ),
-    );
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 11. SKIP (SEEK) IN VIDEO
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * PATCH /api/v1/videos/:videoId/seek
- *
- * KEY CONCEPT: Seeking vs Progress
- * Seeking is different from progress saving. When a user drags the playbar to
- * a specific position:
- * - If they seek FORWARD past their furthest point → update progress
- * - If they seek BACKWARD → don't overwrite their furthest point (use $max)
- *
- * The client sends { targetSeconds: 180 } (where the user seeked to).
- * We respond with the confirmed seek position.
- *
- * NOTE: This is a lightweight record operation. The actual video seek happens
- * entirely in the browser's HTML5 video player — your server just needs to
- * remember the position for resume-on-return.
- */
-export const seekVideo = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-  const { targetSeconds } = req.body;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const seekTo = parseFloat(targetSeconds);
-  if (isNaN(seekTo) || seekTo < 0) {
-    throw new ApiError(400, "Invalid target position");
-  }
-
-  const video = await Video.findById(videoId).select("duration");
-  if (!video) throw new ApiError(404, "Video not found");
-
-  const clampedSeek = Math.min(seekTo, video.duration);
-
-  // Use $max so seeking backward doesn't erase furthest-watched position
-  await WatchHistory.findOneAndUpdate(
-    { user: req.user._id, video: videoId },
-    {
-      $max: { watchedSeconds: clampedSeek },
-      $set: { lastWatchedAt: new Date() },
-    },
-    { upsert: true },
-  );
-
-  return res
-    .status(200)
-    .json(
-      new ApiResponse(200, { seekedTo: clampedSeek }, "Seek position saved"),
-    );
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 12. SAVE VIDEO TO A PLAYLIST
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * PATCH /api/v1/playlists/:playlistId/videos/:videoId
- *
- * KEY CONCEPT: $addToSet vs $push
- * $push adds to an array — even if the value already exists (creates duplicates).
- * $addToSet adds to an array ONLY if the value isn't already there — like a Set.
- * Always use $addToSet when you want unique items in an array.
- *
- * SYSTEM FAILURE TIP: Without the 500-video cap validation (in the schema),
- * and without server-side enforcement, a user could add the same video 100,000
- * times and make populate() return an enormous response that OOMs your server.
- */
-export const addVideoToPlaylist = asyncHandler(async (req, res) => {
-  const { playlistId, videoId } = req.params;
-
-  if (
-    !mongoose.isValidObjectId(playlistId) ||
-    !mongoose.isValidObjectId(videoId)
-  ) {
-    throw new ApiError(400, "Invalid playlist or video ID");
-  }
-
-  const playlist = await Playlist.findById(playlistId);
-  if (!playlist) throw new ApiError(404, "Playlist not found");
-
-  // Authorization: only the playlist owner can add videos
-  if (playlist.owner.toString() !== req.user._id.toString()) {
-    throw new ApiError(403, "Forbidden: You do not own this playlist");
-  }
-
-  // Enforce max playlist size
-  if (playlist.videos.length >= 500) {
-    throw new ApiError(400, "Playlist is full (max 500 videos)");
-  }
-
-  const videoExists = await Video.exists({ _id: videoId, status: "ready" });
-  if (!videoExists) throw new ApiError(404, "Video not found");
-
-  // $addToSet prevents adding duplicates
-  const updatedPlaylist = await Playlist.findByIdAndUpdate(
-    playlistId,
-    { $addToSet: { videos: videoId } },
-    { new: true },
-  );
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, updatedPlaylist, "Video added to playlist"));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 13. CREATE A PLAYLIST
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * POST /api/v1/playlists
- *
- * SYSTEM FAILURE TIP: Limit how many playlists a user can create.
- * Without a cap, a bot could create millions of playlists and fill your DB.
- * Check count before creating and enforce a reasonable limit (e.g., 100 playlists/user).
- *
- * COMMON BEGINNER MISTAKE: Not validating that the user doesn't already have
- * a playlist with the same name. Duplicate names are confusing UX — either
- * enforce uniqueness or at least warn the user.
- */
-export const createPlaylist = asyncHandler(async (req, res) => {
-  const { name, description, isPublic = false } = req.body;
-
-  if (!name?.trim()) {
-    throw new ApiError(400, "Playlist name is required");
-  }
-
-  // Enforce per-user playlist cap
-  const playlistCount = await Playlist.countDocuments({ owner: req.user._id });
-  if (playlistCount >= 100) {
-    throw new ApiError(400, "You have reached the maximum of 100 playlists");
-  }
-
-  const playlist = await Playlist.create({
-    owner: req.user._id,
-    name: name.trim(),
-    description: description?.trim() || "",
-    isPublic: Boolean(isPublic),
-    videos: [],
-  });
-
-  return res
-    .status(201)
-    .json(new ApiResponse(201, playlist, "Playlist created successfully"));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 14. GET VIDEO LIKE COUNT
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * GET /api/v1/videos/:videoId/likes/count
- *
- * KEY CONCEPT: Cached counter vs live count
- * We return likeCount from the Video document (the cached value updated by $inc).
- * We do NOT do Like.countDocuments({ video: videoId }) on every request.
- *
- * countDocuments on a large Like collection with millions of records, even with
- * an index, adds latency on every page load. The cached counter is instant.
- *
- * SYSTEM FAILURE TIP: Cached counters can drift out of sync if bugs occur
- * (e.g., a like is deleted but $inc: -1 doesn't run due to an error). Schedule
- * a nightly reconciliation job that recalculates all counts from the Like
- * collection and resets the cached values.
- */
-export const getLikeCount = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const video = await Video.findById(videoId).select("likeCount");
-  if (!video) throw new ApiError(404, "Video not found");
-
-  // If user is logged in, also tell them whether they liked it
-  let hasLiked = false;
-  if (req.user) {
-    hasLiked = !!(await Like.exists({ user: req.user._id, video: videoId }));
+  if (!isOwner && !video.isPublished) {
+    throw new ApiError(403, "This video is not available");
   }
 
   return res
     .status(200)
-    .json(
-      new ApiResponse(
-        200,
-        { likeCount: video.likeCount, hasLiked },
-        "Like count fetched",
-      ),
-    );
+    .json(new ApiResponse(200, video, "Video fetched successfully"));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 15. GET VIDEO COMMENT COUNT + PAGINATED COMMENTS
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── 6. GET VIDEO LINK (streaming URL) ───────────────────────────────────────
+
 /**
- * GET /api/v1/videos/:videoId/comments?page=1&limit=20
+ * In production, you don't serve raw Cloudinary URLs directly to all users.
+ * Reasons:
+ * 1. Signed URLs — Cloudinary supports time-limited signed URLs so people
+ *    can't hotlink your videos forever.
+ * 2. CDN — You'd typically serve through a CDN like Cloudflare that caches
+ *    video segments close to the user. Reduces latency and bandwidth cost.
+ * 3. DRM — Paid content uses Digital Rights Management to prevent downloading.
  *
- * KEY CONCEPT: Cursor-based pagination vs offset pagination
- * We use offset pagination here (skip + limit) — simple but has a flaw:
- * if new comments are added between page 1 and page 2 fetches, items shift
- * and page 2 might show duplicates.
- *
- * For production comment sections (like YouTube), cursor-based pagination
- * is better: the client sends { afterId: "last_seen_comment_id" } and the
- * query is: { _id: { $lt: afterId } } — this is stable even as new items
- * are inserted. But offset is fine for learning.
- *
- * KEY CONCEPT: $lookup for nested replies
- * We optionally populate each top-level comment with its first N replies.
- * This is a nested $lookup (aggregation within aggregation) — advanced but powerful.
- */
-export const getComments = asyncHandler(async (req, res) => {
-  const { videoId } = req.params;
-  const { page = 1, limit = 20 } = req.query;
-
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
-  const video = await Video.findById(videoId).select("commentCount");
-  if (!video) throw new ApiError(404, "Video not found");
-
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.min(50, parseInt(limit));
-  const skip = (pageNum - 1) * limitNum;
-
-  // Fetch top-level comments only (parent: null)
-  const comments = await Comment.find({ video: videoId, parent: null })
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limitNum)
-    .populate("author", "username avatar");
-
-  return res.status(200).json(
-    new ApiResponse(
-      200,
-      {
-        comments,
-        totalComments: video.commentCount,
-        page: pageNum,
-        totalPages: Math.ceil(video.commentCount / limitNum),
-      },
-      "Comments fetched",
-    ),
-  );
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 16. GET VIDEO COUNT (for a user's channel or global)
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * GET /api/v1/videos/count?userId=<id>
- *
- * KEY CONCEPT: countDocuments vs estimatedDocumentCount
- * - countDocuments({ filter }): accurate count respecting the filter, uses index.
- * - estimatedDocumentCount(): reads from collection metadata, extremely fast,
- *   but only works for the TOTAL count (no filter), and may be slightly stale.
- *
- * For a user's video count, use countDocuments (we need to filter by owner).
- * For "total videos on the platform" (admin stats), estimatedDocumentCount is fine.
- *
- * SECURITY TIP: If userId is not provided, require admin role to get the global
- * count. Don't expose platform-wide statistics to anonymous users.
- */
-export const getVideoCount = asyncHandler(async (req, res) => {
-  const { userId } = req.query;
-
-  let filter = { status: "ready", isPublished: true };
-
-  if (userId) {
-    if (!mongoose.isValidObjectId(userId)) {
-      throw new ApiError(400, "Invalid user ID");
-    }
-    filter.owner = userId;
-
-    // If the requesting user is viewing their OWN channel, count ALL videos
-    // (including private/unlisted). If viewing another channel, only public.
-    if (req.user && req.user._id.toString() === userId.toString()) {
-      delete filter.isPublished; // see all their own videos
-      delete filter.status;
-    } else {
-      filter.visibility = "public";
-    }
-  }
-
-  const count = await Video.countDocuments(filter);
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, { count }, "Video count fetched"));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 17. GET VIDEO LINK (shareable URL)
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * GET /api/v1/videos/:videoId/link
- *
- * KEY CONCEPT: Signed URLs for private/unlisted content
- * For public videos, the shareable link is simply your frontend URL.
- * For unlisted videos, you might want to generate a time-limited signed URL
- * so the link expires after 7 days (like YouTube's unlisted behavior).
- *
- * For truly private videos, never return the raw storage URL — generate a
- * short-lived signed URL from Cloudinary or S3 that expires in minutes.
- *
- * KEY CONCEPT: URL shortening / slug generation
- * Sharing a link like /watch?v=68f3a... (MongoDB ObjectId) is fine.
- * Some apps generate a short slug (e.g., /watch/abc123) using nanoid.
- * Store the slug in the Video model and add a unique index on it.
- *
- * SECURITY TIP: Don't return the raw videoFile (storage) URL for private videos.
- * Only return the streaming/playback URL, and only after access control checks.
+ * For this clone, we return the HLS URL directly.
+ * HLS (.m3u8) is a playlist file — the player fetches small .ts video segments
+ * sequentially. If the user's connection is slow, the player switches to a
+ * lower quality playlist automatically.
  */
 export const getVideoLink = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
-  if (!mongoose.isValidObjectId(videoId)) {
-    throw new ApiError(400, "Invalid video ID");
-  }
-
   const video = await Video.findById(videoId).select(
-    "title visibility status isPublished owner",
+    "hlsUrl videoFile visibility isPublished owner status",
   );
 
-  if (!video || video.status !== "ready") {
+  if (!video) {
     throw new ApiError(404, "Video not found");
   }
 
-  // Authorization for private videos
-  if (video.visibility === "private") {
-    if (!req.user || video.owner.toString() !== req.user._id.toString()) {
-      throw new ApiError(403, "This video is private");
-    }
+  if (video.status !== "ready") {
+    throw new ApiError(
+      425,
+      "Video is still processing. Please try again later.",
+    );
+    // 425 = Too Early (RFC 8470). More semantically correct than 400 here.
   }
 
-  // For public/unlisted, return the shareable frontend URL
-  const BASE_URL = process.env.FRONTEND_URL || "https://yourapp.com";
-  const shareableLink = `${BASE_URL}/watch/${videoId}`;
+  const isOwner = req.user && video.owner.equals(req.user._id);
+  if (!isOwner && (video.visibility === "private" || !video.isPublished)) {
+    throw new ApiError(403, "Access denied");
+  }
 
-  // Metadata for link previews (Open Graph / Twitter Cards)
-  const linkData = {
-    url: shareableLink,
-    videoId,
-    title: video.title,
-    visibility: video.visibility,
-    // In production: add expiresAt for unlisted/private signed URLs
-  };
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        streamUrl: video.hlsUrl || video.videoFile,
+        type: video.hlsUrl ? "hls" : "mp4",
+      },
+      "Stream URL fetched",
+    ),
+  );
+});
+
+// ─── 7. GET ALL VIDEOS (filters, search, pagination) ─────────────────────────
+
+/**
+ * KEY CONCEPT: Aggregation Pipeline
+ * For complex queries — filtering, searching, sorting, joining, paginating —
+ * Mongoose's .find() is too limited. MongoDB's aggregation pipeline processes
+ * documents through a series of stages (like Unix pipe):
+ *   $match → $lookup → $sort → $skip → $limit → $project
+ *
+ * mongoose-aggregate-paginate-v2 wraps this with automatic page/limit handling.
+ *
+ * BEGINNER MISTAKE: Using .find().skip(10000).limit(20). Skip is O(n) —
+ * MongoDB scans and discards 10,000 documents before returning yours.
+ * Use cursor-based pagination in production (keyset pagination) for large sets.
+ */
+export const getAllVideos = asyncHandler(async (req, res) => {
+  const {
+    page = 1,
+    limit = 20,
+    query,
+    sortBy = "createdAt",
+    sortType = "desc",
+    category,
+    tags,
+    minDuration,
+    maxDuration,
+  } = req.query;
+
+  const matchStage = buildSearchQuery({
+    query,
+    category,
+    tags: tags ? tags.split(",") : undefined,
+    minDuration: minDuration ? Number(minDuration) : undefined,
+    maxDuration: maxDuration ? Number(maxDuration) : undefined,
+  });
+
+  // Always filter to only public, ready, published videos for this endpoint
+  matchStage.visibility = "public";
+  matchStage.status = "ready";
+  matchStage.isPublished = true;
+
+  const sortStage = { [sortBy]: sortType === "asc" ? 1 : -1 };
+
+  const pipeline = [
+    { $match: matchStage },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+    { $sort: sortStage },
+    { $project: { __v: 0 } },
+  ];
+
+  const options = buildPaginationOptions(page, limit);
+
+  // Video.aggregatePaginate comes from mongoose-aggregate-paginate-v2 plugin
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
 
   return res
     .status(200)
-    .json(new ApiResponse(200, linkData, "Video link generated"));
+    .json(new ApiResponse(200, result, "Videos fetched successfully"));
+});
+
+// ─── 8. TOGGLE PUBLISH STATUS ─────────────────────────────────────────────────
+
+export const togglePublishStatus = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+
+  const video = await Video.findById(videoId).select(
+    "isPublished visibility status",
+  );
+
+  if (!video) {
+    throw new ApiError(404, "Video not found");
+  }
+
+  if (video.status !== "ready") {
+    throw new ApiError(
+      400,
+      "Cannot toggle publish status on an unprocessed video",
+    );
+  }
+
+  // Atomic toggle — no race condition since findByIdAndUpdate is atomic
+  const updatedVideo = await Video.findByIdAndUpdate(
+    videoId,
+    {
+      $set: {
+        isPublished: !video.isPublished,
+        // When unpublishing, set visibility to private automatically
+        visibility: !video.isPublished ? "public" : "private",
+      },
+    },
+    { new: true },
+  ).select("isPublished visibility title");
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(
+        200,
+        updatedVideo,
+        `Video ${updatedVideo.isPublished ? "published" : "unpublished"} successfully`,
+      ),
+    );
+});
+
+// ─── 9. INCREMENT VIEW COUNT ──────────────────────────────────────────────────
+
+/**
+ * PRODUCTION NOTE: Real view counting is NOT a simple $inc.
+ * YouTube uses a complex system:
+ * 1. A "view" only counts if the user watches >30 seconds.
+ * 2. Duplicate views from the same IP/user within 24h are ignored.
+ * 3. Views are counted via an event stream (Kafka/Kinesis) and processed
+ *    asynchronously — the counter you see has a delay of minutes to hours.
+ * 4. The count is cached in Redis and synced to the DB periodically.
+ *
+ * For this clone, we do a simple $inc with a basic deduplication check
+ * using a session or cookie. This is good enough for learning.
+ */
+export const incrementViewCount = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(videoId)) {
+    throw new ApiError(400, "Invalid video ID");
+  }
+
+  // Instance method on the Video model — atomic $inc
+  const video = await Video.findById(videoId);
+  if (!video) {
+    throw new ApiError(404, "Video not found");
+  }
+
+  const updatedVideo = await video.incrementViews();
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(200, { views: updatedVideo.views }, "View count updated"),
+    );
+});
+
+// ─── 10. GET VIDEOS BY CATEGORY ───────────────────────────────────────────────
+
+export const getVideosByCategory = asyncHandler(async (req, res) => {
+  const { category } = req.params;
+  const { page = 1, limit = 20 } = req.query;
+
+  const options = buildPaginationOptions(page, limit);
+
+  const pipeline = [
+    {
+      $match: {
+        category,
+        visibility: "public",
+        status: "ready",
+        isPublished: true,
+      },
+    },
+    { $sort: { views: -1, createdAt: -1 } },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+  ];
+
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, result, `Videos in category "${category}"`));
+});
+
+// ─── 11. GET TRENDING VIDEOS ──────────────────────────────────────────────────
+
+/**
+ * TRENDING ALGORITHM NOTE:
+ * Real trending uses a score combining recency + views + likes + comments,
+ * often called a "decay function." A video from today with 1000 views ranks
+ * higher than one from last year with 10000 views.
+ *
+ * Simple formula (Wilson score or decay):
+ *   score = views / (hoursOld ^ gravity)
+ *
+ * We implement a basic version here with MongoDB's $expr and date arithmetic.
+ * In production, this score is pre-computed by a background job every few
+ * minutes and stored as a field — you never compute it per-request.
+ */
+export const getTrendingVideos = asyncHandler(async (req, res) => {
+  const { limit = 20, days = 7 } = req.query;
+
+  const since = new Date();
+  since.setDate(since.getDate() - Number(days));
+
+  const videos = await Video.aggregate([
+    {
+      $match: {
+        visibility: "public",
+        status: "ready",
+        isPublished: true,
+        createdAt: { $gte: since },
+      },
+    },
+    {
+      // Add a computed trending score field
+      $addFields: {
+        ageInHours: {
+          $divide: [
+            { $subtract: [new Date(), "$createdAt"] },
+            1000 * 60 * 60, // ms → hours
+          ],
+        },
+      },
+    },
+    {
+      $addFields: {
+        trendingScore: {
+          $divide: [
+            { $add: ["$views", { $multiply: ["$likeCount", 3] }] }, // likes worth 3x views
+            { $pow: [{ $add: ["$ageInHours", 2] }, 1.5] }, // gravity decay
+          ],
+        },
+      },
+    },
+    { $sort: { trendingScore: -1 } },
+    { $limit: Number(limit) },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+    { $project: { trendingScore: 0, ageInHours: 0, __v: 0 } },
+  ]);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, videos, "Trending videos fetched"));
+});
+
+// ─── 12. GET VIDEOS BY TAG ────────────────────────────────────────────────────
+
+export const getVideosByTag = asyncHandler(async (req, res) => {
+  const { tag } = req.params;
+  const { page = 1, limit = 20 } = req.query;
+
+  const options = buildPaginationOptions(page, limit);
+
+  const pipeline = [
+    {
+      $match: {
+        tags: tag.toLowerCase().trim(), // tags are normalized by pre-save hook
+        visibility: "public",
+        status: "ready",
+        isPublished: true,
+      },
+    },
+    { $sort: { views: -1 } },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+    { $project: { __v: 0 } },
+  ];
+
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, result, `Videos tagged with "${tag}"`));
+});
+
+// ─── 13. SEARCH VIDEOS BY TITLE ───────────────────────────────────────────────
+
+/**
+ * KEY CONCEPT: MongoDB Full-Text Search
+ * The $text operator uses the text index we defined on { title, description }.
+ * It tokenizes words, removes stop words ("the", "a"), and stems them.
+ * { $meta: "textScore" } gives each result a relevance score — sort by it.
+ *
+ * LIMITATION: MongoDB's built-in text search is basic. Production search
+ * (YouTube, Netflix) uses Elasticsearch or Algolia — they support typo
+ * tolerance, synonyms, faceted filtering, and relevance tuning that MongoDB
+ * simply cannot match.
+ */
+export const searchVideosByTitle = asyncHandler(async (req, res) => {
+  const { q, page = 1, limit = 20 } = req.query;
+
+  if (!q || q.trim().length < 2) {
+    throw new ApiError(400, "Search query must be at least 2 characters");
+  }
+
+  const options = buildPaginationOptions(page, limit);
+
+  const pipeline = [
+    {
+      $match: {
+        $text: { $search: q.trim() },
+        visibility: "public",
+        status: "ready",
+        isPublished: true,
+      },
+    },
+    {
+      // Add text relevance score
+      $addFields: {
+        relevanceScore: { $meta: "textScore" },
+      },
+    },
+    { $sort: { relevanceScore: -1, views: -1 } },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+    { $project: { __v: 0, relevanceScore: 0 } },
+  ];
+
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, result, `Search results for "${q}"`));
+});
+
+// ─── 14. GET CHANNEL VIDEOS ───────────────────────────────────────────────────
+
+/**
+ * Channel page shows different content based on viewer:
+ * - Owner: sees all videos including private and processing
+ * - Others: sees only public, published, ready videos
+ *
+ * This is a common pattern called "contextual authorization" — the same
+ * endpoint returns different data based on who's asking.
+ */
+export const getChannelVideos = asyncHandler(async (req, res) => {
+  const { channelId } = req.params;
+  const { page = 1, limit = 20, status, visibility } = req.query;
+
+  if (!mongoose.Types.ObjectId.isValid(channelId)) {
+    throw new ApiError(400, "Invalid channel ID");
+  }
+
+  const isOwner = req.user && req.user._id.toString() === channelId;
+
+  const matchStage = {
+    owner: new mongoose.Types.ObjectId(channelId),
+  };
+
+  if (!isOwner) {
+    // Public viewers only see published public ready videos
+    matchStage.visibility = "public";
+    matchStage.status = "ready";
+    matchStage.isPublished = true;
+  } else {
+    // Owner can filter their own videos by status/visibility
+    if (status) matchStage.status = status;
+    if (visibility) matchStage.visibility = visibility;
+  }
+
+  const options = buildPaginationOptions(page, limit);
+
+  const pipeline = [
+    { $match: matchStage },
+    { $sort: { createdAt: -1 } },
+    { $project: { __v: 0 } },
+  ];
+
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, result, "Channel videos fetched"));
+});
+
+// ─── 15. UPDATE VIDEO STATUS (processing pipeline) ────────────────────────────
+
+/**
+ * This endpoint is called by your background worker/job queue — NOT by users.
+ * It should be protected by a secret API key (not JWT), or be on an internal
+ * network unreachable from the public internet.
+ *
+ * PRODUCTION FLOW:
+ * 1. Video uploaded → status: "pending"
+ * 2. Worker picks it up → status: "processing"
+ * 3. FFmpeg transcodes to 360p, 720p, 1080p → generates HLS segments
+ * 4. Segments uploaded to CDN/S3
+ * 5. Worker calls this endpoint → status: "ready", hlsUrl updated
+ * 6. If FFmpeg fails → status: "failed"
+ *
+ * The admin.middleware.js or a separate workerAuth middleware guards this route.
+ */
+export const updateVideoStatus = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+  const { status, hlsUrl, resolution } = req.body;
+
+  const validStatuses = ["pending", "processing", "ready", "failed"];
+  if (!validStatuses.includes(status)) {
+    throw new ApiError(
+      400,
+      `Invalid status. Must be one of: ${validStatuses.join(", ")}`,
+    );
+  }
+
+  const updateData = { status };
+  if (hlsUrl) updateData.hlsUrl = hlsUrl;
+  if (resolution) updateData.resolution = resolution;
+
+  const video = await Video.findByIdAndUpdate(
+    videoId,
+    { $set: updateData },
+    { new: true },
+  );
+
+  if (!video) {
+    throw new ApiError(404, "Video not found");
+  }
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, video, `Video status updated to "${status}"`));
+});
+
+// ─── 16. GET RECOMMENDED VIDEOS ───────────────────────────────────────────────
+
+/**
+ * RECOMMENDATION NOTE:
+ * Real recommendation engines (YouTube's) use machine learning — collaborative
+ * filtering, neural networks trained on billions of watch history records.
+ * Our version does basic content-based filtering: same category/tags, different video.
+ *
+ * This is intentionally simple but demonstrates the right query pattern.
+ * A real implementation would call a separate ML microservice and return
+ * pre-computed recommendations from a cache (Redis).
+ */
+export const getRecommendedVideos = asyncHandler(async (req, res) => {
+  const { videoId } = req.params;
+  const { limit = 10 } = req.query;
+
+  const currentVideo = await Video.findById(videoId).select(
+    "tags category owner",
+  );
+
+  if (!currentVideo) {
+    throw new ApiError(404, "Video not found");
+  }
+
+  const videos = await Video.aggregate([
+    {
+      $match: {
+        _id: { $ne: new mongoose.Types.ObjectId(videoId) }, // exclude current video
+        visibility: "public",
+        status: "ready",
+        isPublished: true,
+        $or: [
+          { tags: { $in: currentVideo.tags } }, // same tags
+          { category: currentVideo.category }, // same category
+        ],
+      },
+    },
+    {
+      // Score by how many tags overlap
+      $addFields: {
+        tagOverlap: {
+          $size: {
+            $ifNull: [{ $setIntersection: ["$tags", currentVideo.tags] }, []],
+          },
+        },
+      },
+    },
+    { $sort: { tagOverlap: -1, views: -1 } },
+    { $limit: Number(limit) },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+    { $project: { tagOverlap: 0, __v: 0 } },
+  ]);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, videos, "Recommended videos fetched"));
+});
+
+// ─── 17. GET VIDEOS BY ADMIN (moderation) ─────────────────────────────────────
+
+/**
+ * Admins need to see ALL videos regardless of status, visibility, or publish state.
+ * This is the moderation dashboard query.
+ *
+ * SECURITY: This MUST be behind verifyRole("admin") middleware.
+ * Never expose unpublished/private content without proper role checks.
+ * Admin routes should also be rate limited and fully logged/audited.
+ */
+export const getVideosByAdmin = asyncHandler(async (req, res) => {
+  const {
+    page = 1,
+    limit = 50,
+    status,
+    visibility,
+    isPublished,
+    ownerId,
+    sortBy = "createdAt",
+    sortType = "desc",
+  } = req.query;
+
+  const matchStage = {};
+  if (status) matchStage.status = status;
+  if (visibility) matchStage.visibility = visibility;
+  if (isPublished !== undefined)
+    matchStage.isPublished = isPublished === "true";
+  if (ownerId && mongoose.Types.ObjectId.isValid(ownerId)) {
+    matchStage.owner = new mongoose.Types.ObjectId(ownerId);
+  }
+
+  const options = buildPaginationOptions(page, limit);
+
+  const pipeline = [
+    { $match: matchStage },
+    { $sort: { [sortBy]: sortType === "asc" ? 1 : -1 } },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+        pipeline: [{ $project: { username: 1, avatar: 1, email: 1 } }],
+      },
+    },
+    { $unwind: "$ownerDetails" },
+  ];
+
+  const result = await Video.aggregatePaginate(
+    Video.aggregate(pipeline),
+    options,
+  );
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, result, "Admin: all videos fetched"));
 });

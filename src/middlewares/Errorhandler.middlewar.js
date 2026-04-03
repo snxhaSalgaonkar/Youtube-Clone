@@ -21,7 +21,8 @@
  *   res.json(err) — this sends everything including the stack trace.
  */
 
-import { ApiError } from "../utils/apiResponse.js";
+//import { ApiError } from "../utils/apiResponse.js";
+import { ApiError } from "../utils/ApiError.js";
 
 export const globalErrorHandler = (err, req, res, next) => {
   // Log the full error internally (use a proper logger in production)

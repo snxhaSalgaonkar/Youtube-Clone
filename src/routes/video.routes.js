@@ -1,183 +1,148 @@
 /**
- * ROUTES — video.routes.js
+ * VIDEO ROUTES
  *
- * KEY CONCEPT: Express Router
- * Instead of defining all routes in app.js, we use express.Router() to create
- * a mini-application with its own routes. app.js then mounts it at a prefix:
- *   app.use('/api/v1/videos', videoRouter)
- *   app.use('/api/v1/playlists', playlistRouter)
+ * KEY CONCEPT: Route → Middleware Chain → Controller
+ * Every route is a pipeline. Middleware runs left-to-right.
+ * If any middleware calls next(error), it skips to the error handler.
+ * If it calls next() without arguments, the next function in the chain runs.
  *
- * KEY CONCEPT: Route-level Middleware
- * router.use(verifyJWT) applies the middleware to ALL routes defined AFTER it.
- * Routes defined BEFORE it (like the public search/play routes) are unprotected.
- * This is "public routes first, then auth wall, then protected routes" pattern.
+ * ROUTE DESIGN:
+ * - Use RESTful conventions: nouns in URLs, HTTP verbs for actions.
+ * - GET    = read (idempotent — safe to repeat)
+ * - POST   = create
+ * - PATCH  = partial update (preferred over PUT for partial changes)
+ * - DELETE = remove
+ * - Avoid verbs in URLs: /videos/uploadVideo ❌ → POST /videos ✓
  *
- * KEY CONCEPT: Multer (file upload middleware)
- * multer() processes multipart/form-data BEFORE the controller runs.
- * upload.fields([...]) lets you specify multiple named file fields.
- * The files end up in req.files (for .fields()) or req.file (for .single()).
- *
- * SECURITY TIP: Configure multer with strict limits:
- * - fileSize: cap how large a file can be (500MB for video is generous)
- * - fileFilter: check MIME type — only accept video/* and image/*
- * Without these, anyone can upload any file of any size.
- *
- * COMMON BEGINNER MISTAKE: Not setting limits on multer. A user could upload
- * a 100GB file and freeze your server or fill your disk.
+ * ORDERING MATTERS: Specific routes before parameterized ones.
+ * /videos/trending must come before /videos/:videoId, otherwise Express
+ * would treat "trending" as a videoId.
  */
 
 import { Router } from "express";
-import multer from "multer";
-import path from "path";
-import os from "os";
-
-import { verifyJWT, optionalAuth } from "../middlewares/auth.middleware.js";
 import {
   uploadVideo,
   publishVideo,
-  searchVideos,
-  likeVideo,
-  dislikeVideo,
-  addComment,
-  updateVideo,
-  playVideo,
-  saveToWatchHistory,
-  savePlaybackProgress,
-  seekVideo,
-  addVideoToPlaylist,
-  createPlaylist,
-  getLikeCount,
-  getComments,
-  getVideoCount,
-  getVideoLink,
-} from "../controllers/video.controller.js";
-
-/**
- * KEY CONCEPT: Importing from a second controller file
- * As your app grows, one controller file becomes too large to maintain.
- * Split by feature group and import from each file separately.
- * The router doesn't care which file the function came from — it just
- * needs a reference to the function.
- */
-import {
+  updateVideoDetails,
   deleteVideo,
   getVideoById,
-  getUserVideos,
-} from "../controllers/video2.controller.js";
+  getVideoLink,
+  getAllVideos,
+  togglePublishStatus,
+  incrementViewCount,
+  getVideosByCategory,
+  getTrendingVideos,
+  getVideosByTag,
+  searchVideosByTitle,
+  getChannelVideos,
+  updateVideoStatus,
+  getRecommendedVideos,
+  getVideosByAdmin,
+} from "../controllers/video.controller.js";
 
-// ─── MULTER CONFIGURATION ─────────────────────────────────────────────────────
+import { verifyJWT } from "../middlewares/auth.middleware.js";
+import { verifyVideoOwnership } from "../middlewares/verifyOwnership.middleware.js";
+import { verifyRole } from "../middlewares/admin.middleware.js";
+import {
+  uploadVideoAndThumbnail,
+  uploadThumbnailOnly,
+  handleMulterErrors,
+} from "../middlewares/multer.middleware.js";
+import {
+  uploadRateLimiter,
+  searchRateLimiter,
+  viewCountRateLimiter,
+} from "../middlewares/rateLimiter.middleware.js";
+import { validate } from "../middlewares/validate.middleware.js";
+import {
+  uploadVideoValidator,
+  updateVideoValidator,
+} from "../validators/video.validator.js";
 
-/**
- * KEY CONCEPT: Multer storage strategies
- * diskStorage: saves file to disk. Good for large files. Remember to clean up
- *   temp files after uploading to Cloudinary.
- * memoryStorage: saves file in RAM as a Buffer. Good for small images but
- *   dangerous for large videos — will OOM your server.
- *
- * We use diskStorage with the OS temp directory.
- * SECURITY: Use a random filename (Date.now + random suffix) so two simultaneous
- * uploads don't overwrite each other (race condition).
- */
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, os.tmpdir()); // OS temp dir, cleaned up by the OS eventually
-  },
-  filename: (req, file, cb) => {
-    // Sanitize filename: remove anything that isn't alphanumeric, dot, or dash
-    const safeExt = path.extname(file.originalname).replace(/[^a-z0-9.]/gi, "");
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${safeExt}`);
-  },
-});
+const router = Router();
 
-// MIME type whitelist
-const fileFilter = (req, file, cb) => {
-  const allowedVideoTypes = [
-    "video/mp4",
-    "video/webm",
-    "video/quicktime",
-    "video/x-matroska",
-  ];
-  const allowedImageTypes = ["image/jpeg", "image/png", "image/webp"];
-  const allowed = [...allowedVideoTypes, ...allowedImageTypes];
+// ─── PUBLIC ROUTES (no auth required) ────────────────────────────────────────
 
-  if (allowed.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error(`File type ${file.mimetype} is not allowed`), false);
-  }
-};
+// IMPORTANT: Specific named routes MUST come before /:videoId
+// Otherwise "trending", "search", "category" would be parsed as video IDs
 
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: {
-    fileSize: 500 * 1024 * 1024, // 500 MB hard limit
-    files: 2, // max 2 files per request (video + thumbnail)
-  },
-});
+router.get("/trending", getTrendingVideos);
+router.get("/search", searchRateLimiter, searchVideosByTitle);
+router.get("/category/:category", getVideosByCategory);
+router.get("/tag/:tag", getVideosByTag);
+router.get("/", getAllVideos);
 
-// ─── VIDEO ROUTES ──────────────────────────────────────────────────────────────
+// Channel videos — optionally authenticated (owner sees private videos)
+router.get("/channel/:channelId", verifyJWT, getChannelVideos);
 
-const videoRouter = Router();
+// ─── PARAMETERIZED PUBLIC ROUTES ─────────────────────────────────────────────
 
-// ── PUBLIC ROUTES (no auth required) ──
-videoRouter.get("/search", searchVideos);
-videoRouter.get("/count", optionalAuth, getVideoCount);
+// verifyJWT here is optional — used only to check ownership for private videos
+// Some implementations use a separate optionalAuth middleware for this
+router.get("/:videoId", verifyJWT, getVideoById);
+router.get("/:videoId/stream", verifyJWT, getVideoLink);
+router.get("/:videoId/recommended", getRecommendedVideos);
 
-/**
- * ROUTE ORDER WARNING — specific routes MUST come before wildcard routes.
- *
- * Express matches routes top-to-bottom and stops at the first match.
- * If "/:videoId" came before "/search", then GET /search would be caught
- * by /:videoId with videoId = "search" — and the search controller
- * would never run. Always register specific string routes BEFORE
- * parameterized (/:param) ones on the same HTTP method.
- *
- * Safe order for GET routes on this router:
- *   GET /search          ← specific, registered first ✅
- *   GET /count           ← specific, registered first ✅
- *   GET /user/:userId    ← different param name, no conflict ✅
- *   GET /:videoId        ← wildcard, registered last ✅
- *   GET /:videoId/play   ← sub-route of wildcard, fine after parent ✅
- */
-videoRouter.get("/user/:userId", optionalAuth, getUserVideos); // channel page
-videoRouter.get("/:videoId", optionalAuth, getVideoById); // single video metadata
-videoRouter.get("/:videoId/play", optionalAuth, playVideo);
-videoRouter.get("/:videoId/link", optionalAuth, getVideoLink);
-videoRouter.get("/:videoId/likes/count", optionalAuth, getLikeCount);
-videoRouter.get("/:videoId/comments", optionalAuth, getComments);
+// View count — rate limited per IP+videoId to prevent manipulation
+router.post("/:videoId/view", viewCountRateLimiter, incrementViewCount);
 
-// ── AUTH WALL — all routes below require a valid JWT ──
-videoRouter.use(verifyJWT);
+// ─── PROTECTED ROUTES (JWT required) ─────────────────────────────────────────
 
-// ── PROTECTED ROUTES ──
-videoRouter.post(
+// Upload: rate limited + multer + validation + auth
+router.post(
   "/",
-  upload.fields([
-    { name: "videoFile", maxCount: 1 },
-    { name: "thumbnail", maxCount: 1 },
-  ]),
+  verifyJWT,
+  uploadRateLimiter,
+  handleMulterErrors(uploadVideoAndThumbnail),
+  validate(uploadVideoValidator),
   uploadVideo,
 );
-videoRouter.patch("/:videoId", upload.single("thumbnail"), updateVideo);
-videoRouter.delete("/:videoId", deleteVideo); // ← NEW: delete video
-videoRouter.patch("/:videoId/publish", publishVideo);
-videoRouter.post("/:videoId/like", likeVideo);
-videoRouter.post("/:videoId/dislike", dislikeVideo);
-videoRouter.post("/:videoId/comments", addComment);
-videoRouter.post("/:videoId/history", saveToWatchHistory);
-videoRouter.patch("/:videoId/progress", savePlaybackProgress);
-videoRouter.patch("/:videoId/seek", seekVideo);
 
-export { videoRouter };
+// Operations on a specific video — ownership verified before controller runs
+router.patch(
+  "/:videoId",
+  verifyJWT,
+  verifyVideoOwnership,
+  handleMulterErrors(uploadThumbnailOnly), // optional thumbnail update
+  validate(updateVideoValidator),
+  updateVideoDetails,
+);
 
-// ─── PLAYLIST ROUTES ───────────────────────────────────────────────────────────
+router.delete("/:videoId", verifyJWT, verifyVideoOwnership, deleteVideo);
 
-const playlistRouter = Router();
+router.patch(
+  "/:videoId/publish",
+  verifyJWT,
+  verifyVideoOwnership,
+  publishVideo,
+);
 
-playlistRouter.use(verifyJWT); // all playlist routes require auth
+router.patch(
+  "/:videoId/toggle-publish",
+  verifyJWT,
+  verifyVideoOwnership,
+  togglePublishStatus,
+);
 
-playlistRouter.post("/", createPlaylist);
-playlistRouter.patch("/:playlistId/videos/:videoId", addVideoToPlaylist);
+// ─── INTERNAL/WORKER ROUTES ───────────────────────────────────────────────────
 
-export { playlistRouter };
+/**
+ * This route is called by your background processing worker, NOT users.
+ * In production:
+ * 1. This route should NOT be exposed on the public-facing server.
+ * 2. It should be on an internal network or require a separate worker API key.
+ * 3. Here we use verifyRole("admin") as a stand-in. Replace with workerAuth
+ *    middleware in production that checks a shared secret from env vars.
+ */
+router.patch(
+  "/:videoId/status",
+  verifyJWT,
+  verifyRole("admin"), // Replace with workerAuth in production
+  updateVideoStatus,
+);
+
+// ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
+
+router.get("/admin/all", verifyJWT, verifyRole("admin"), getVideosByAdmin);
+
+export default router;

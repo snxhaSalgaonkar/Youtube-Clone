@@ -6,25 +6,6 @@ import { ApiResponse } from "../utils/ApiResponse.js";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 
-const generateAcessAndRefreshTokens = async (userId) => {
-  try {
-    const user = await User.findById(userId);
-    const accessToken = user.generateAccessToken();
-    const refreshToken = user.generateRefreshToken();
-
-    user.refreshToken = refreshToken;
-    await user.save({ validateBeforeSave: false });
-    console.log("Generated Access and Refresh Tokens");
-    console.log("accessToken ", accessToken);
-    console.log("refreshToken ", refreshToken);
-    console.log("User after storing refresh token ", user);
-
-    return { accessToken, refreshToken };
-  } catch (error) {
-    throw new ApiError(500, "Error while generating Acess And Refresh Tokens");
-  }
-};
-
 const registerUser = asyncHandler(async (req, res) => {
   console.log("Inside register user controller");
   console.log("req.body ", req.body);
@@ -228,6 +209,25 @@ const logoutUser = asyncHandler(async (req, res) => {
     .clearCookie("refreshToken", options)
     .json(new ApiResponse(200, {}, "User logged Out"));
 });
+
+const generateAcessAndRefreshTokens = async (userId) => {
+  try {
+    const user = await User.findById(userId);
+    const accessToken = user.generateAccessToken();
+    const refreshToken = user.generateRefreshToken();
+
+    user.refreshToken = refreshToken;
+    await user.save({ validateBeforeSave: false });
+    console.log("Generated Access and Refresh Tokens");
+    console.log("accessToken ", accessToken);
+    console.log("refreshToken ", refreshToken);
+    console.log("User after storing refresh token ", user);
+
+    return { accessToken, refreshToken };
+  } catch (error) {
+    throw new ApiError(500, "Error while generating Acess And Refresh Tokens");
+  }
+};
 
 const refreshAccessToken = asyncHandler(async (req, res) => {
   //1. get refresh token from cookies
@@ -514,6 +514,14 @@ const getWatchHistory = asyncHandler(async (req, res) => {
       ),
     );
 });
+
+//delete account
+//verify email
+//forgot password
+//reste password
+//Get all users(admin only)
+//Ban/unban user admin only)
+// update user role (admin only)
 
 export {
   registerUser,
