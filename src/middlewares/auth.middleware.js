@@ -30,7 +30,7 @@ export const verifyJWT = asyncHandler(async (req, _, next) => {
     if (!user) {
       throw new ApiError(404, "User not found");
     }
-    console.log("User found for logout: ", user);
+    console.log("User found: ", user);
 
     req.user = user;
     next();

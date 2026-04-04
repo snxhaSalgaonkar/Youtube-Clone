@@ -37,7 +37,7 @@ import { ApiError } from "../utils/ApiError.js";
  * 5 uploads per hour per IP is generous enough for real users,
  * tight enough to stop bot abuse.
  */
-export const uploadRateLimiter = rateLimit({
+const rawUploadRateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour window
   max: 5, // max 5 requests per window per IP
   standardHeaders: true, // Return rate limit info in RateLimit-* headers
@@ -45,6 +45,7 @@ export const uploadRateLimiter = rateLimit({
 
   // Custom error handler — returns your ApiError format instead of default HTML
   handler: (req, res, next, options) => {
+    console.log("❌ Rate limit exceeded for IP:", req.ip);
     next(
       new ApiError(
         429,
@@ -55,9 +56,24 @@ export const uploadRateLimiter = rateLimit({
 
   // Skip rate limiting for admin users (identified after JWT decode)
   skip: (req) => {
-    return req.user?.role === "admin";
+    const isAdmin = req.user?.role === "admin";
+    console.log("📊 Rate limiter check - User:", req.user?.email, "IsAdmin:", isAdmin);
+    return isAdmin;
   },
 });
+
+// Wrapper to log rate limiter flow
+export const uploadRateLimiter = (req, res, next) => {
+  console.log("🚦 uploadRateLimiter: Checking rate limits...");
+  rawUploadRateLimiter(req, res, (err) => {
+    if (!err) {
+      console.log("✅ Rate limit check passed, proceeding...");
+    } else {
+      console.log("❌ Rate limit error:", err.message);
+    }
+    next(err);
+  });
+};
 
 // ─── GENERAL API RATE LIMITER ─────────────────────────────────────────────────
 

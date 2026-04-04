@@ -94,7 +94,7 @@ router.post(
   verifyJWT,
   uploadRateLimiter,
   handleMulterErrors(uploadVideoAndThumbnail),
-  //validate(uploadVideoValidator),
+  validate(uploadVideoValidator),
   uploadVideo,
 );
 

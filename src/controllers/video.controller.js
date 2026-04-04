@@ -115,14 +115,28 @@ import fs from "fs";
 // });
 
 export const uploadVideo = asyncHandler(async (req, res) => {
+  console.log("🎬 uploadVideo controller: Starting upload...");
   const { title, description, tags, category, visibility } = req.body;
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
+
+  console.log("📁 Files received:", {
+    video: videoLocalPath,
+    thumbnail: thumbnailLocalPath,
+  });
+  console.log("📝 Body data:", {
+    title,
+    description,
+    tags,
+    category,
+    visibility,
+  });
 
   try {
     if (!videoLocalPath) throw new ApiError(400, "Video file is required");
     if (!thumbnailLocalPath) throw new ApiError(400, "Thumbnail is required");
 
+    console.log("⏳ Checking for duplicate titles...");
     // duplicate check
     const existingVideo = await Video.findOne({
       owner: req.user._id,
@@ -136,7 +150,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
       );
     }
 
-    // ... rest of your code (uploads, db create etc)
+    console.log("☁️ Uploading to Cloudinary...");
     //Upload both files to Cloudinary concurrently — don't await sequentially,
     // that wastes time. Promise.all runs them in parallel.
     const [videoUpload, thumbnailUpload] = await Promise.all([
@@ -144,6 +158,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
       uploadToCloudinary(thumbnailLocalPath, "image"),
     ]);
 
+    console.log("✅ Cloudinary uploads completed");
     if (!videoUpload?.url) {
       throw new ApiError(500, "Video upload failed. Please try again.");
     }
@@ -151,6 +166,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
       throw new ApiError(500, "Thumbnail upload failed. Please try again.");
     }
 
+    console.log("⏱️ Extracting video duration...");
     // Extract video duration from Cloudinary metadata (or use FFmpeg locally)
     const duration = await extractVideoDuration(videoUpload);
 
@@ -159,6 +175,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     // automatically if you're on a paid plan. Otherwise you'd run FFmpeg yourself.
     const hlsUrl = generateHLSUrl(videoUpload.public_id);
 
+    console.log("💾 Saving to database...");
     const video = await Video.create({
       owner: req.user._id,
       videoFile: videoUpload.url,
@@ -170,19 +187,23 @@ export const uploadVideo = asyncHandler(async (req, res) => {
       tags: tags ? JSON.parse(tags) : [],
       category: category || "General",
       visibility: visibility || "private",
-      status: "pending", // Not ready until processing completes
+      // status: "pending", // Not ready until processing completes
+      status: "ready", // for learning pruposes
       isPublished: false,
     });
 
+    console.log("✅ Video saved successfully, sending response...");
     return res
       .status(201)
       .json(new ApiResponse(201, video, "Video uploaded successfully."));
   } finally {
     // Always clean up temp files whether success or failure
+    console.log("🧹 Cleaning up temp files...");
     if (videoLocalPath && fs.existsSync(videoLocalPath))
       fs.unlinkSync(videoLocalPath);
     if (thumbnailLocalPath && fs.existsSync(thumbnailLocalPath))
       fs.unlinkSync(thumbnailLocalPath);
+    console.log("video created: " + video);
   }
 });
 // ─── 2. PUBLISH VIDEO ─────────────────────────────────────────────────────────
@@ -213,6 +234,7 @@ export const publishVideo = asyncHandler(async (req, res) => {
 
   // instance method defined on the schema — keeps publish logic in one place
   const updatedVideo = await video.publish();
+  console.log("video published");
 
   return res
     .status(200)
@@ -278,6 +300,7 @@ export const updateVideoDetails = asyncHandler(async (req, res) => {
   if (!updatedVideo) {
     throw new ApiError(404, "Video not found");
   }
+  console.log("updated video: " + updatedVideo);
 
   return res
     .status(200)

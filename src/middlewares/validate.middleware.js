@@ -36,11 +36,13 @@ import { asyncHandler } from "../utils/asyncHandler.js";
  */
 export const validate = (validators) => {
   return asyncHandler(async (req, res, next) => {
+    console.log("🔄 Validate middleware: Running validators...");
     // Run all validators in sequence (they modify req by attaching validation metadata)
     await Promise.all(validators.map((validator) => validator.run(req)));
 
     // Extract validation results
     const errors = validationResult(req);
+    console.log("✅ Validation results:", errors.array().length, "errors");
 
     // If validation failed, throw ApiError with all error details
     if (!errors.isEmpty()) {
@@ -53,6 +55,7 @@ export const validate = (validators) => {
       throw new ApiError(400, "Validation failed", formattedErrors);
     }
 
+    console.log("✅ Validation passed. Calling next()...");
     // If validation passed, proceed to next middleware/controller
     next();
   });

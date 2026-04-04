@@ -48,15 +48,7 @@ const diskStorage = multer.diskStorage({
   },
 });
 
-// const diskStorage = multer.diskStorage({
-//   destination: function (req, file, cb) {
-//     cb(null, "./public/temp");
-//   },
-//   filename: function (req, file, cb) {
-//     // Use original filename (Cloudinary will handle uniqueness via unique_filename)
-//     cb(null, file.originalname);
-//   },
-// });
+
 
 // Legacy export for simple file uploads (if used elsewhere)
 export const upload = multer({ storage: diskStorage });
@@ -121,9 +113,16 @@ const videoFileFilter = (req, file, cb) => {
  */
 export const handleMulterErrors = (multerMiddleware) => {
   return (req, res, next) => {
+    console.log("🔄 handleMulterErrors: Starting multer processing...");
     multerMiddleware(req, res, (err) => {
-      if (!err) return next();
+      console.log("✅ multer callback called. Error:", err?.message || "None");
+      if (!err) {
+        console.log("✅ No multer errors. Files:", Object.keys(req.files || {}));
+        console.log("✅ Body:", req.body);
+        return next(); // Files parsed successfully, move to next middleware
+      }
 
+      console.log("❌ Multer error:", err.code || err.message);
       if (err.code === "LIMIT_FILE_SIZE") {
         return next(
           new ApiError(
