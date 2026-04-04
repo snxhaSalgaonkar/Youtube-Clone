@@ -33,15 +33,30 @@ import { ApiError } from "../utils/ApiError.js";
  * Disk storage for temporary file uploads
  * Files are saved to ./public/temp and later uploaded to Cloudinary
  */
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const diskStorage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, "./public/temp");
+    cb(null, path.join(__dirname, "../../public/temp")); // ← absolute path
   },
   filename: function (req, file, cb) {
-    // Use original filename (Cloudinary will handle uniqueness via unique_filename)
     cb(null, file.originalname);
   },
 });
+
+// const diskStorage = multer.diskStorage({
+//   destination: function (req, file, cb) {
+//     cb(null, "./public/temp");
+//   },
+//   filename: function (req, file, cb) {
+//     // Use original filename (Cloudinary will handle uniqueness via unique_filename)
+//     cb(null, file.originalname);
+//   },
+// });
 
 // Legacy export for simple file uploads (if used elsewhere)
 export const upload = multer({ storage: diskStorage });

@@ -27,10 +27,9 @@ app.use("/api/v1/users", userRouter);
 
 //http://localhiost:8000/api/v1/users/register
 
-import watchHistoryRouter from "./routes/watchHistory.route.js";
+
 import videoRouter from "./routes/video.routes.js";
 
-app.use("/api/v1/watch-history", watchHistoryRouter);
 app.use("/api/v1/videos", videoRouter);
 
 export default app;

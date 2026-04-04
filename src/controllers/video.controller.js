@@ -28,6 +28,7 @@ import {
   buildSearchQuery,
   buildPaginationOptions,
 } from "../utils/videoUtils.js";
+import fs from "fs";
 
 // ─── 1. UPLOAD VIDEO ──────────────────────────────────────────────────────────
 
@@ -49,68 +50,141 @@ import {
  * When you scale to multiple server instances, only one server has that file.
  * Use object storage (Cloudinary, S3, GCS) — it's shared across all instances.
  */
+// export const uploadVideo = asyncHandler(async (req, res) => {
+//   const { title, description, tags, category, visibility } = req.body;
+//   console.log("req.files →", req.files);
+//   console.log("req.body →", req.body);
+
+//   // req.files is populated by multer middleware
+//   const videoLocalPath = req.files?.videoFile?.[0]?.path;
+//   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
+
+//   if (!videoLocalPath) {
+//     throw new ApiError(400, "Video file is required");
+//   }
+//   if (!thumbnailLocalPath) {
+//     throw new ApiError(400, "Thumbnail is required");
+//   }
+
+//   // Upload both files to Cloudinary concurrently — don't await sequentially,
+//   // that wastes time. Promise.all runs them in parallel.
+//   const [videoUpload, thumbnailUpload] = await Promise.all([
+//     uploadToCloudinary(videoLocalPath, "video"),
+//     uploadToCloudinary(thumbnailLocalPath, "image"),
+//   ]);
+
+//   if (!videoUpload?.url) {
+//     throw new ApiError(500, "Video upload failed. Please try again.");
+//   }
+//   if (!thumbnailUpload?.url) {
+//     throw new ApiError(500, "Thumbnail upload failed. Please try again.");
+//   }
+
+//   // Extract video duration from Cloudinary metadata (or use FFmpeg locally)
+//   const duration = await extractVideoDuration(videoUpload);
+
+//   // Generate HLS URL from the Cloudinary public_id
+//   // HLS = HTTP Live Streaming. Cloudinary can serve adaptive bitrate streams
+//   // automatically if you're on a paid plan. Otherwise you'd run FFmpeg yourself.
+//   const hlsUrl = generateHLSUrl(videoUpload.public_id);
+
+//   const video = await Video.create({
+//     owner: req.user._id,
+//     videoFile: videoUpload.url,
+//     hlsUrl,
+//     thumbnail: thumbnailUpload.url,
+//     title: title.trim(),
+//     description: description?.trim() || "",
+//     duration,
+//     tags: tags ? JSON.parse(tags) : [],
+//     category: category || "General",
+//     visibility: visibility || "private",
+//     status: "pending", // Not ready until processing completes
+//     isPublished: false,
+//   });
+
+//   return res
+//     .status(201)
+//     .json(
+//       new ApiResponse(
+//         201,
+//         video,
+//         "Video uploaded successfully. Processing will begin shortly.",
+//       ),
+//     );
+// });
+
 export const uploadVideo = asyncHandler(async (req, res) => {
   const { title, description, tags, category, visibility } = req.body;
-
-  // req.files is populated by multer middleware
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
 
-  if (!videoLocalPath) {
-    throw new ApiError(400, "Video file is required");
+  try {
+    if (!videoLocalPath) throw new ApiError(400, "Video file is required");
+    if (!thumbnailLocalPath) throw new ApiError(400, "Thumbnail is required");
+
+    // duplicate check
+    const existingVideo = await Video.findOne({
+      owner: req.user._id,
+      title: title.trim(),
+    });
+
+    if (existingVideo) {
+      throw new ApiError(
+        409,
+        "You have already uploaded a video with this title",
+      );
+    }
+
+    // ... rest of your code (uploads, db create etc)
+    //Upload both files to Cloudinary concurrently — don't await sequentially,
+    // that wastes time. Promise.all runs them in parallel.
+    const [videoUpload, thumbnailUpload] = await Promise.all([
+      uploadToCloudinary(videoLocalPath, "video"),
+      uploadToCloudinary(thumbnailLocalPath, "image"),
+    ]);
+
+    if (!videoUpload?.url) {
+      throw new ApiError(500, "Video upload failed. Please try again.");
+    }
+    if (!thumbnailUpload?.url) {
+      throw new ApiError(500, "Thumbnail upload failed. Please try again.");
+    }
+
+    // Extract video duration from Cloudinary metadata (or use FFmpeg locally)
+    const duration = await extractVideoDuration(videoUpload);
+
+    // Generate HLS URL from the Cloudinary public_id
+    // HLS = HTTP Live Streaming. Cloudinary can serve adaptive bitrate streams
+    // automatically if you're on a paid plan. Otherwise you'd run FFmpeg yourself.
+    const hlsUrl = generateHLSUrl(videoUpload.public_id);
+
+    const video = await Video.create({
+      owner: req.user._id,
+      videoFile: videoUpload.url,
+      hlsUrl,
+      thumbnail: thumbnailUpload.url,
+      title: title.trim(),
+      description: description?.trim() || "",
+      duration,
+      tags: tags ? JSON.parse(tags) : [],
+      category: category || "General",
+      visibility: visibility || "private",
+      status: "pending", // Not ready until processing completes
+      isPublished: false,
+    });
+
+    return res
+      .status(201)
+      .json(new ApiResponse(201, video, "Video uploaded successfully."));
+  } finally {
+    // Always clean up temp files whether success or failure
+    if (videoLocalPath && fs.existsSync(videoLocalPath))
+      fs.unlinkSync(videoLocalPath);
+    if (thumbnailLocalPath && fs.existsSync(thumbnailLocalPath))
+      fs.unlinkSync(thumbnailLocalPath);
   }
-  if (!thumbnailLocalPath) {
-    throw new ApiError(400, "Thumbnail is required");
-  }
-
-  // Upload both files to Cloudinary concurrently — don't await sequentially,
-  // that wastes time. Promise.all runs them in parallel.
-  const [videoUpload, thumbnailUpload] = await Promise.all([
-    uploadToCloudinary(videoLocalPath, "video"),
-    uploadToCloudinary(thumbnailLocalPath, "image"),
-  ]);
-
-  if (!videoUpload?.url) {
-    throw new ApiError(500, "Video upload failed. Please try again.");
-  }
-  if (!thumbnailUpload?.url) {
-    throw new ApiError(500, "Thumbnail upload failed. Please try again.");
-  }
-
-  // Extract video duration from Cloudinary metadata (or use FFmpeg locally)
-  const duration = await extractVideoDuration(videoUpload);
-
-  // Generate HLS URL from the Cloudinary public_id
-  // HLS = HTTP Live Streaming. Cloudinary can serve adaptive bitrate streams
-  // automatically if you're on a paid plan. Otherwise you'd run FFmpeg yourself.
-  const hlsUrl = generateHLSUrl(videoUpload.public_id);
-
-  const video = await Video.create({
-    owner: req.user._id,
-    videoFile: videoUpload.url,
-    hlsUrl,
-    thumbnail: thumbnailUpload.url,
-    title: title.trim(),
-    description: description?.trim() || "",
-    duration,
-    tags: tags ? JSON.parse(tags) : [],
-    category: category || "General",
-    visibility: visibility || "private",
-    status: "pending", // Not ready until processing completes
-    isPublished: false,
-  });
-
-  return res
-    .status(201)
-    .json(
-      new ApiResponse(
-        201,
-        video,
-        "Video uploaded successfully. Processing will begin shortly.",
-      ),
-    );
 });
-
 // ─── 2. PUBLISH VIDEO ─────────────────────────────────────────────────────────
 
 /**
