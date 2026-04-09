@@ -264,10 +264,6 @@ export const updateVideoDetails = asyncHandler(async (req, res) => {
   if (category !== undefined) updateFields.category = category;
   if (visibility !== undefined) updateFields.visibility = visibility;
 
-  if (Object.keys(updateFields).length === 0) {
-    throw new ApiError(400, "No valid fields provided for update");
-  }
-
   // Handle optional thumbnail replacement
   const thumbnailLocalPath = req.file?.path;
   if (thumbnailLocalPath) {
