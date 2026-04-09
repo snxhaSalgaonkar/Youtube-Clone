@@ -64,6 +64,7 @@ const rawUploadRateLimiter = rateLimit({
 
 // Wrapper to log rate limiter flow
 export const uploadRateLimiter = (req, res, next) => {
+  console.log("*******************upload rateLimiter called from rateLimiter.M********** ")
   console.log("🚦 uploadRateLimiter: Checking rate limits...");
   rawUploadRateLimiter(req, res, (err) => {
     if (!err) {

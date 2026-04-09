@@ -1,4 +1,5 @@
 import mongoose, { Schema } from "mongoose";
+import mongooseAggregatePaginate from "mongoose-aggregate-paginate-v2";
 
 /**
  * VIDEO MODEL — YouTube Clone
@@ -75,7 +76,6 @@ const videoSchema = new Schema(
       default: 0,
       min: 0,
     },
-
 
     status: {
       type: String,
@@ -246,6 +246,7 @@ videoSchema.statics.getPublicFeed = async function ({
     .populate("owner", "username avatar") // only fetch username & avatar, not password etc.
     .select("-__v"); // exclude the internal version key
 };
+videoSchema.plugin(mongooseAggregatePaginate);
 
 // ─── MODEL EXPORT ─────────────────────────────────────────────────────────────
 

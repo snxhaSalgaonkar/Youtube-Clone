@@ -23,7 +23,7 @@ const registerUser = asyncHandler(async (req, res) => {
   //9. return response
 
   //1. get user details from frontend
-  const { username, email, fullname, password } = req.body;
+  const { username, email, fullname, password, role } = req.body;
 
   //2. validation
   // if(fullname== ""){
@@ -86,6 +86,7 @@ const registerUser = asyncHandler(async (req, res) => {
     email,
     password,
     username: username.toLowerCase(),
+    role,
   });
   console.log("User created :", user);
 

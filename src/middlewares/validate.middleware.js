@@ -36,6 +36,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
  */
 export const validate = (validators) => {
   return asyncHandler(async (req, res, next) => {
+    console.log("**************validate called from validate.M*******");
     console.log("🔄 Validate middleware: Running validators...");
     // Run all validators in sequence (they modify req by attaching validation metadata)
     await Promise.all(validators.map((validator) => validator.run(req)));

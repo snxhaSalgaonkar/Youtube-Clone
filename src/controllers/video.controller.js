@@ -115,7 +115,7 @@ import fs from "fs";
 // });
 
 export const uploadVideo = asyncHandler(async (req, res) => {
-  console.log("🎬 uploadVideo controller: Starting upload...");
+  console.log("🎬 *********uploadVideo controller: Starting upload...");
   const { title, description, tags, category, visibility } = req.body;
   const videoLocalPath = req.files?.videoFile?.[0]?.path;
   const thumbnailLocalPath = req.files?.thumbnail?.[0]?.path;
@@ -131,7 +131,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     category,
     visibility,
   });
-
+  let video;
   try {
     if (!videoLocalPath) throw new ApiError(400, "Video file is required");
     if (!thumbnailLocalPath) throw new ApiError(400, "Thumbnail is required");
@@ -176,7 +176,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     const hlsUrl = generateHLSUrl(videoUpload.public_id);
 
     console.log("💾 Saving to database...");
-    const video = await Video.create({
+    video = await Video.create({
       owner: req.user._id,
       videoFile: videoUpload.url,
       hlsUrl,
@@ -189,7 +189,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
       visibility: visibility || "private",
       // status: "pending", // Not ready until processing completes
       status: "ready", // for learning pruposes
-      isPublished: false,
+      isPublished: true,
     });
 
     console.log("✅ Video saved successfully, sending response...");
@@ -274,6 +274,11 @@ export const updateVideoDetails = asyncHandler(async (req, res) => {
     if (!thumbnailUpload?.url) {
       throw new ApiError(500, "Thumbnail upload failed");
     }
+    if (Object.keys(updateFields).length === 0 && !thumbnailLocalPath) {
+      throw new ApiError(400, "No valid fields provided for update");
+    }
+
+    // Handle optional thumbnail replacement
 
     // Delete the old thumbnail from Cloudinary to avoid orphaned files
     // piling up and eating your storage quota.
@@ -317,7 +322,7 @@ export const updateVideoDetails = asyncHandler(async (req, res) => {
  * CRITICAL: Always delete the file from storage AFTER the DB record is removed.
  * If DB delete fails, throw an error — don't delete files for a record that
  * still exists. Orphaned DB records are worse than orphaned files.
- */
+ **/
 export const deleteVideo = asyncHandler(async (req, res) => {
   const { videoId } = req.params;
 
@@ -503,12 +508,19 @@ export const getAllVideos = asyncHandler(async (req, res) => {
 
   const options = buildPaginationOptions(page, limit);
 
-  // Video.aggregatePaginate comes from mongoose-aggregate-paginate-v2 plugin
+  //Video.aggregatePaginate comes from mongoose-aggregate-paginate-v2 plugin
   const result = await Video.aggregatePaginate(
     Video.aggregate(pipeline),
     options,
   );
+  console.log("GetAllvideo successfully " + result);
 
+  //mongooseAggregatePaginate;
+
+  // const result = await Video.mongooseAggregatePaginate(
+  //   Video.aggregate(pipeline),
+  //   options,
+  // );
   return res
     .status(200)
     .json(new ApiResponse(200, result, "Videos fetched successfully"));
@@ -546,7 +558,7 @@ export const togglePublishStatus = asyncHandler(async (req, res) => {
     },
     { new: true },
   ).select("isPublished visibility title");
-
+  console.log(" Video publish toggled: " + updatedVideo);
   return res
     .status(200)
     .json(

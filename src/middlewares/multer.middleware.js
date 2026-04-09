@@ -113,6 +113,7 @@ const videoFileFilter = (req, file, cb) => {
  */
 export const handleMulterErrors = (multerMiddleware) => {
   return (req, res, next) => {
+    console.log("*************handleMulterErrors called from multer.M*************")
     console.log("🔄 handleMulterErrors: Starting multer processing...");
     multerMiddleware(req, res, (err) => {
       console.log("✅ multer callback called. Error:", err?.message || "None");
