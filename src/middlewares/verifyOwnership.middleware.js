@@ -46,16 +46,9 @@ export const verifyVideoOwnership = asyncHandler(async (req, res, next) => {
     throw new ApiError(404, "Video not found");
   }
 
-  // .equals() is Mongoose's safe way to compare ObjectIds.
-  // Never use == or === on ObjectIds — they are objects, not primitives.
-  // "507f1f77bcf86cd799439011" === ObjectId("507f1f77bcf86cd799439011") = false
-  // Even toString() comparison is fragile. Always use .equals().
   if (!video.owner.equals(req.user._id)) {
     throw new ApiError(403, "You do not have permission to modify this video");
   }
-
-  // Attach to req so controllers can use it without an extra DB query
-  // This is the "request enrichment" pattern — middleware adds context.
   req.video = video;
 
   next();

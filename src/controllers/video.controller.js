@@ -206,6 +206,7 @@ export const uploadVideo = asyncHandler(async (req, res) => {
     console.log("video created: " + video);
   }
 });
+
 // ─── 2. PUBLISH VIDEO ─────────────────────────────────────────────────────────
 
 /**

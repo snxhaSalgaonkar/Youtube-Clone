@@ -27,9 +27,10 @@ app.use("/api/v1/users", userRouter);
 
 //http://localhiost:8000/api/v1/users/register
 
-
 import videoRouter from "./routes/video.routes.js";
 
 app.use("/api/v1/videos", videoRouter);
+
+import commentRouter from "./routes/comment.routes.js";
 
 export default app;
