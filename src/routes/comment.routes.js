@@ -14,7 +14,7 @@ import { verifyJWT } from "../middlewares/auth.middleware.js";
 import {
   verifyCommentOwnership,
   verifyAdmin,
-} from "../middlewares/verifyCommentOwnership.js";
+} from "../middlewares/Verifycommentownership .middleware.js";
 
 const router = Router();
 

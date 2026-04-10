@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import mongoSanitize from "express-mongo-sanitize";
 
 const app = express();
 
@@ -14,6 +15,7 @@ app.use(express.json({ limit: "16kb" }));
 app.use(express.urlencoded({ extended: true, limit: "16kb" }));
 app.use(express.static("public"));
 app.use(cookieParser());
+app.use(mongoSanitize());
 
 // app.get("/", (req, res) => {
 //     res.send("Hello World!")
@@ -32,5 +34,6 @@ import videoRouter from "./routes/video.routes.js";
 app.use("/api/v1/videos", videoRouter);
 
 import commentRouter from "./routes/comment.routes.js";
+app.use("/api/v1/comments", commentRouter);
 
 export default app;

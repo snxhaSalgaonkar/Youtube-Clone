@@ -8,7 +8,7 @@ import {
   sanitizeContent,
   buildPaginationOptions,
   isValidObjectId,
-} from "../utils/comment.utils.js";
+} from "../utils/commentUtils.js";
 
 /**
  * MAX NESTING DEPTH = 2
