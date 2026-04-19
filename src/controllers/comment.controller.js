@@ -118,7 +118,7 @@ export const addComment = asyncHandler(async (req, res) => {
     content: safeContent,
     parentComment: parentComment || null,
   });
-
+  console.log("comment created" + comment);
   /**
    * .populate() here fetches the owner's username and avatar immediately
    * so the frontend can render the comment without a follow-up request.
