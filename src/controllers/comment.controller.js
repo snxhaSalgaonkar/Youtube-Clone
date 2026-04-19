@@ -9,7 +9,8 @@ import {
   buildPaginationOptions,
   isValidObjectId,
 } from "../utils/commentUtils.js";
-
+import { syncCommentCount } from "../utils/updateCommentCount.js";
+import { util } from "zod";
 /**
  * MAX NESTING DEPTH = 2
  *
@@ -119,6 +120,7 @@ export const addComment = asyncHandler(async (req, res) => {
     parentComment: parentComment || null,
   });
   console.log("comment created" + comment);
+  await syncCommentCount(videoId);
   /**
    * .populate() here fetches the owner's username and avatar immediately
    * so the frontend can render the comment without a follow-up request.
@@ -205,6 +207,16 @@ export const updateComment = asyncHandler(async (req, res) => {
  * must filter isDeleted: false (or handle deleted comments intentionally).
  */
 export const deleteComment = asyncHandler(async (req, res) => {
+  const { commentId } = req.params;
+
+  const comment = await Comment.findById(commentId);
+
+  if (!comment) {
+    throw new ApiError(404, "Comment not found");
+  }
+
+  const videoId = comment.video;
+
   await Comment.findByIdAndUpdate(req.comment._id, {
     $set: {
       isDeleted: true,
@@ -212,6 +224,7 @@ export const deleteComment = asyncHandler(async (req, res) => {
     },
   });
 
+  await syncCommentCount(videoId);
   return res
     .status(200)
     .json(new ApiResponse(200, null, "Comment deleted successfully"));
