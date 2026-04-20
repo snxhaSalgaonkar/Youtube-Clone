@@ -1,6 +1,7 @@
 import mongoose, { Schema } from "mongoose";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
+import { number } from "zod";
 
 const userSchema = new Schema(
   {
@@ -49,6 +50,14 @@ const userSchema = new Schema(
       type: String,
       enum: ["user", "admin"],
       default: "user",
+    },
+    subscribersCount: {
+      type: number,
+      default: 0,
+    },
+    subscribedToCount: {
+      type: number,
+      default: 0,
     },
   },
   {
