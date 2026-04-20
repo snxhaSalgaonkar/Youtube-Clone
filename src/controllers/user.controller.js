@@ -118,9 +118,9 @@ const loginUser = asyncHandler(async (req, res) => {
 
   //1. get login credentials from frontend
   console.log("*************************");
-  console.log("request: ", req);
+  // console.log("request: ", req);
   const { email, password, username } = req.body;
-  console.log("Login credentials ", req.body);
+  //console.log("Login credentials ", req.body);
 
   //2. validation
   if (!email && !username) {
@@ -142,7 +142,7 @@ const loginUser = asyncHandler(async (req, res) => {
   //4. check for password correctness
   const isPassword = await user.isPasswordCorrect(password);
   if (!isPassword) {
-    throw new ApiError(401, "Invalid User credentials");
+    throw new ApiError(401, "Invalid User credentials: enter correct password");
   }
   console.log("password Matched");
 

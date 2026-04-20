@@ -1,10 +1,10 @@
 // controllers/like.controller.js
 
 import mongoose from "mongoose";
-import { Like } from "../models/like.model.js";
+import { Like } from "../models/likes.model.js";
 import { Video } from "../models/video.model.js";
 import { Comment } from "../models/comment.model.js";
-import { Tweet } from "../models/tweet.model.js";
+//import { Tweet } from "../models/tweet.model.js";
 import { buildLikeQuery } from "../utils/buildLikeQuery.js";
 
 // ─── HELPER ────────────────────────────────────────────────────────────────────
@@ -13,7 +13,7 @@ import { buildLikeQuery } from "../utils/buildLikeQuery.js";
 const modelMap = {
   Video: Video,
   Comment: Comment,
-  Tweet: Tweet,
+  //Tweet: Tweet,
 };
 
 // Validates that the referenced document actually exists in its collection
@@ -61,11 +61,13 @@ const toggleVideoLike = async (req, res) => {
 
   if (existingLike) {
     // Was liked → now unliked
+    await Video.findByIdAndUpdate(videoId, { $inc: { likeCount: -1 } });
     return res.status(200).json({ liked: false, message: "Video unliked" });
   }
 
   // Was not liked → create like
   await Like.create(query);
+  await Video.findByIdAndUpdate(videoId, { $inc: { likeCount: 1 } });
   return res.status(201).json({ liked: true, message: "Video liked" });
 };
 
@@ -83,6 +85,7 @@ const toggleCommentLike = async (req, res) => {
 
   const exists = await validateTarget("Comment", commentId);
   if (!exists) {
+    await Video.findByIdAndUpdate(commentId, { $inc: { likeCount: -1 } });
     return res.status(404).json({ message: "Comment not found" });
   }
 
@@ -94,6 +97,7 @@ const toggleCommentLike = async (req, res) => {
   }
 
   await Like.create(query);
+  await Video.findByIdAndUpdate(commentId, { $inc: { likeCount: 1 } });
   return res.status(201).json({ liked: true, message: "Comment liked" });
 };
 
@@ -109,6 +113,7 @@ const toggleTweetLike = async (req, res) => {
 
   const exists = await validateTarget("Tweet", tweetId);
   if (!exists) {
+    await Video.findByIdAndUpdate(tweetId, { $inc: { likeCount: -1 } });
     return res.status(404).json({ message: "Tweet not found" });
   }
 
@@ -120,6 +125,7 @@ const toggleTweetLike = async (req, res) => {
   }
 
   await Like.create(query);
+  await Video.findByIdAndUpdate(tweetId, { $inc: { likeCount: -1 } });
   return res.status(201).json({ liked: true, message: "Tweet liked" });
 };
 

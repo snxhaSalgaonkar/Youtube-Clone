@@ -51,6 +51,8 @@ app.use("/api/v1/videos", videoRouter);
 import commentRouter from "./routes/comment.routes.js";
 app.use("/api/v1/comments", commentRouter);
 
+import likeRouter from "./routes/like.routes.js";
+app.use("/api/v1/likes", likeRouter);
 // import watchHistoryRouter from "./routes/watchHistory.route.js";
 // app.use("/api/v1/watch-history", watchHistoryRouter);
 
