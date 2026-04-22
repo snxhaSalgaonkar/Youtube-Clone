@@ -1,14 +1,5 @@
 import mongoose, { Schema } from "mongoose";
 
-/**
- * VISIBILITY RULES (as per schema design):
- * - "public"  → playlist is visible to everyone; created/managed by a channel
- * - "private" → playlist is visible only to the owner; personal user playlist
- *
- * These are enforced at the model level via enum validation.
- * Authorization logic (who can change visibility) belongs in the controller/service layer.
- */
-
 const playlistSchema = new Schema(
   {
     name: {
@@ -26,12 +17,6 @@ const playlistSchema = new Schema(
       maxlength: [500, "Description cannot exceed 500 characters"],
     },
 
-    /**
-     * VISIBILITY ENUM
-     * Never store raw strings without enums in production.
-     * Without enum validation, a bad client payload like visibility: "friends_only"
-     * would silently persist into the DB — corrupting your query logic downstream.
-     */
     visibility: {
       type: String,
       enum: {
@@ -41,71 +26,31 @@ const playlistSchema = new Schema(
       default: "private",
     },
 
-    /**
-     * OWNER (FK → User)
-     * This is always the User who owns or created the playlist.
-     * "Channel" in your system is a representation of the user in public context —
-     * not a separate collection. So owner always points to User._id.
-     *
-     * Beginner mistake: Storing owner as a plain string (e.g., "userId_123").
-     * That breaks .populate(), loses referential integrity, and can't be indexed properly.
-     */
     owner: {
       type: Schema.Types.ObjectId,
       ref: "User",
       required: [true, "Playlist must have an owner"],
-      index: true, // INDEX: frequent query — "get all playlists by this user"
+      index: true,
     },
 
-    /**
-     * VIDEOS ARRAY
-     * Stores references to Video documents.
-     *
-     * IMPORTANT PRODUCTION CONSIDERATION:
-     * If a playlist can grow very large (500+ videos), storing all video refs
-     * inside a single document array will eventually hit MongoDB's 16MB document limit.
-     * For a beginner project this is fine. At scale, use a separate PlaylistItem
-     * collection with (playlistId, videoId, position) — this also enables
-     * efficient reordering and pagination without loading the full document.
-     *
-     * For now: cap is enforced via validate() to keep the document safe.
-     */
-    videos: {
-      type: [
-        {
-          type: Schema.Types.ObjectId,
-          ref: "Video",
-        },
-      ],
-      default: [],
-      validate: {
-        validator: function (arr) {
-          return arr.length <= 500;
-        },
-        message: "A playlist cannot contain more than 500 videos",
-      },
-    },
-
-    /**
-     * THUMBNAIL (optional)
-     * Usually auto-derived from the first video, but allowing explicit override
-     * is a common production pattern (Cloudinary URL or similar CDN URL).
-     */
     thumbnail: {
       type: String,
       default: "",
       trim: true,
+      /**
+       * PRODUCTION NOTE:
+       * In the embedded-array model, thumbnail could be derived from videos[0].
+       * Now that videos live in PlaylistItem, the controller must explicitly set
+       * this field when the first item is added (query PlaylistItem → get video
+       * thumbnail → update playlist.thumbnail).
+       *
+       * Or use a post-save hook on PlaylistItem to update this automatically.
+       * That hook lives in playlistItem.model.js — see that file.
+       */
     },
   },
   {
-    timestamps: true, // automatically manages createdAt and updatedAt
-
-    /**
-     * toJSON / toObject with virtuals: true
-     * Ensures virtual fields (like videoCount) are included when you do
-     * res.json(playlist) or playlist.toObject() in your controller.
-     * Without this, virtuals are invisible in API responses — a very common gotcha.
-     */
+    timestamps: true,
     toJSON: { virtuals: true },
     toObject: { virtuals: true },
   },
@@ -115,42 +60,13 @@ const playlistSchema = new Schema(
 // INDEXES
 // ─────────────────────────────────────────────
 
-/**
- * COMPOUND INDEX: owner + visibility
- *
- * The most common query pattern in a YouTube-like app:
- *   "Fetch all PUBLIC playlists of a channel" → filter by owner + visibility: "public"
- *   "Fetch all PRIVATE playlists of a user"  → filter by owner + visibility: "private"
- *
- * A compound index on (owner, visibility) covers both queries efficiently.
- * Without this, MongoDB does a COLLSCAN — full collection scan — which is catastrophic
- * at scale (imagine scanning 10M playlists to find 5 belonging to a user).
- *
- * Rule of thumb: Index the fields you filter/sort by most frequently, in the
- * order they appear in your query (equality fields first, range/sort fields last).
- */
+// Compound: covers "all public playlists by this user" and "all playlists by this user"
 playlistSchema.index({ owner: 1, visibility: 1 });
 
-/**
- * INDEX: createdAt
- *
- * Used for sorting playlists by newest first — a standard feed pattern.
- * Without this, sorting is done in memory (very expensive for large collections).
- */
+// Sort by newest first on listing pages
 playlistSchema.index({ createdAt: -1 });
 
-/**
- * INDEX: name (text index)
- *
- * Enables full-text search on playlist names via MongoDB's $text operator.
- * Example query: db.playlists.find({ $text: { $search: "gaming highlights" } })
- *
- * This is NOT the same as a regex search (which is slow). Text indexes
- * tokenize and stem words for efficient search.
- *
- * In production, you'd likely graduate to Elasticsearch or Atlas Search,
- * but $text is a solid starting point.
- */
+// Full-text search on name + description
 playlistSchema.index({ name: "text", description: "text" });
 
 // ─────────────────────────────────────────────
@@ -158,27 +74,41 @@ playlistSchema.index({ name: "text", description: "text" });
 // ─────────────────────────────────────────────
 
 /**
- * VIRTUAL: videoCount
- *
- * Derived field — computed on the fly from the videos array length.
- * Never store this as a real field; it will go stale when videos are added/removed
- * unless you manually sync it everywhere (a maintenance nightmare).
- *
- * Virtuals are NOT persisted to MongoDB. They exist only in-memory when you
- * access a document. They appear in API responses only when toJSON.virtuals = true.
- */
-playlistSchema.virtual("videoCount").get(function () {
-  return this.videos?.length ?? 0;
-});
-
-/**
- * VIRTUAL: isPublic
- *
- * Convenience boolean — avoids string comparison in controller/view logic.
- * e.g., if (playlist.isPublic) { ... }  instead of  if (playlist.visibility === "public")
+ * isPublic — convenience boolean, unchanged
  */
 playlistSchema.virtual("isPublic").get(function () {
   return this.visibility === "public";
+});
+
+/**
+ * items — Virtual populate
+ *
+ * This is Mongoose's "virtual populate" feature — it behaves like a JOIN.
+ * It does NOT embed items into the document. It tells Mongoose:
+ * "When someone calls .populate('items') on a Playlist document,
+ *  go look in the PlaylistItem collection for docs where playlistId === this._id"
+ *
+ * HOW IT WORKS:
+ *   ref         → which model to query
+ *   localField  → field on THIS document (_id)
+ *   foreignField→ field on PlaylistItem that must match (_id → playlistId)
+ *   options     → sort by position so videos always come back in correct order
+ *
+ * USAGE IN CONTROLLER:
+ *   const playlist = await Playlist.findById(id).populate("items");
+ *   // playlist.items is now an array of PlaylistItem documents (with video refs)
+ *
+ * WHY NOT JUST QUERY PlaylistItem DIRECTLY?
+ *   You can — and sometimes should (e.g., paginated fetches).
+ *   Virtual populate is for convenience when you need the full playlist + items
+ *   in a single expression. For paginated video lists inside a playlist,
+ *   query PlaylistItem directly with skip/limit.
+ */
+playlistSchema.virtual("items", {
+  ref: "PlaylistItem",
+  localField: "_id",
+  foreignField: "playlistId",
+  options: { sort: { position: 1 } }, // always return in correct order
 });
 
 // ─────────────────────────────────────────────
@@ -186,66 +116,7 @@ playlistSchema.virtual("isPublic").get(function () {
 // ─────────────────────────────────────────────
 
 /**
- * addVideo(videoId)
- *
- * Adds a video to the playlist only if:
- *   1. It's not already in the list (prevents duplicates)
- *   2. The 500-video cap is not exceeded
- *
- * IMPORTANT: Always call .save() after this. The method mutates the document
- * in memory but does NOT persist to DB until save() is called.
- * This is intentional — gives the caller control over when to commit.
- */
-playlistSchema.methods.addVideo = async function (videoId) {
-  const videoObjectId = new mongoose.Types.ObjectId(videoId);
-
-  // .some() with .equals() is correct for ObjectId comparison.
-  // Never use == or === for ObjectIds — they are objects, not primitives.
-  const alreadyExists = this.videos.some((id) => id.equals(videoObjectId));
-
-  if (alreadyExists) {
-    throw new Error("Video already exists in this playlist");
-  }
-
-  if (this.videos.length >= 500) {
-    throw new Error("Playlist has reached the maximum limit of 500 videos");
-  }
-
-  this.videos.push(videoObjectId);
-  return this.save();
-};
-
-/**
- * removeVideo(videoId)
- *
- * Filters out the video by ObjectId. Uses .equals() for correct comparison.
- *
- * Beginner mistake: arr.filter(id => id !== videoId)
- * This ALWAYS returns the full array unchanged because ObjectId !== string.
- * Always use .equals() or compare .toString() versions.
- */
-playlistSchema.methods.removeVideo = async function (videoId) {
-  const videoObjectId = new mongoose.Types.ObjectId(videoId);
-  const initialLength = this.videos.length;
-
-  this.videos = this.videos.filter((id) => !id.equals(videoObjectId));
-
-  if (this.videos.length === initialLength) {
-    throw new Error("Video not found in this playlist");
-  }
-
-  return this.save();
-};
-
-/**
- * toggleVisibility()
- *
- * Flips the playlist between public and private.
- * Useful for a single-action UI toggle button.
- *
- * NOTE: Authorization (is this user the owner? is it a channel?) must be
- * checked in the controller BEFORE calling this method.
- * Models should not contain auth logic — that violates separation of concerns.
+ * toggleVisibility() — unchanged logic, still valid
  */
 playlistSchema.methods.toggleVisibility = async function () {
   this.visibility = this.visibility === "public" ? "private" : "public";
@@ -253,16 +124,34 @@ playlistSchema.methods.toggleVisibility = async function () {
 };
 
 /**
- * isOwnedBy(userId)
- *
- * Ownership check helper. Returns boolean.
- * Use this in your controller before any mutation (add/remove/delete/update).
- *
- * Example in controller:
- *   if (!playlist.isOwnedBy(req.user._id)) throw new ApiError(403, "Forbidden")
+ * isOwnedBy(userId) — unchanged, still valid
  */
 playlistSchema.methods.isOwnedBy = function (userId) {
   return this.owner.equals(new mongoose.Types.ObjectId(userId));
+};
+
+/**
+ * getVideoCount()
+ *
+ * NEW METHOD replacing the old videoCount virtual.
+ *
+ * Since videos no longer live in this document, we can't derive the count
+ * from an array length. We must hit the PlaylistItem collection.
+ *
+ * countDocuments() is an indexed count — it doesn't load documents into memory.
+ * As long as PlaylistItem has an index on playlistId (it does), this is O(log n).
+ *
+ * WHY NOT A VIRTUAL?
+ * Virtuals are synchronous getters. DB calls are async. You cannot await inside
+ * a virtual getter — it would return a Promise object, not a number.
+ * So this is an async instance method instead.
+ *
+ * USAGE:
+ *   const count = await playlist.getVideoCount();
+ */
+playlistSchema.methods.getVideoCount = async function () {
+  const PlaylistItem = mongoose.model("PlaylistItem");
+  return PlaylistItem.countDocuments({ playlistId: this._id });
 };
 
 // ─────────────────────────────────────────────
@@ -270,28 +159,21 @@ playlistSchema.methods.isOwnedBy = function (userId) {
 // ─────────────────────────────────────────────
 
 /**
- * Static: getPublicPlaylistsByOwner(ownerId)
+ * getPublicPlaylistsByOwner(ownerId)
  *
- * Fetches all PUBLIC playlists for a given channel/user.
- * Uses .select() to return only fields needed for a listing view —
- * never return the full document (especially the videos array with 500 refs)
- * when you only need metadata for a list page.
- *
- * This is called "projection" — a core MongoDB performance technique.
+ * Returns metadata only — no items, no video refs.
+ * To get video count per playlist on a listing page, use aggregation
+ * (see getPublicPlaylistsWithCount below) — don't make N+1 calls.
  */
 playlistSchema.statics.getPublicPlaylistsByOwner = async function (ownerId) {
   return this.find({ owner: ownerId, visibility: "public" })
     .select("name description thumbnail createdAt")
     .sort({ createdAt: -1 })
-    .lean(); // .lean() returns plain JS objects instead of Mongoose Documents
-  // Much faster for read-only operations — skips hydration overhead
+    .lean();
 };
 
 /**
- * Static: getPrivatePlaylistsByOwner(ownerId)
- *
- * Fetches all PRIVATE playlists. Only the authenticated owner should trigger this.
- * Authorization guard belongs in the controller/middleware — not here.
+ * getPrivatePlaylistsByOwner(ownerId)
  */
 playlistSchema.statics.getPrivatePlaylistsByOwner = async function (ownerId) {
   return this.find({ owner: ownerId, visibility: "private" })
@@ -301,67 +183,84 @@ playlistSchema.statics.getPrivatePlaylistsByOwner = async function (ownerId) {
 };
 
 /**
- * Static: getPlaylistWithVideos(playlistId)
+ * getPublicPlaylistsWithCount(ownerId)
  *
- * Fetches a single playlist and populates its video references.
- * Uses .populate() to replace ObjectId refs with actual Video documents.
+ * Uses MongoDB Aggregation Pipeline to fetch playlists + their video counts
+ * in a SINGLE database round-trip.
  *
- * "path" = field to populate
- * "select" = which fields from the Video document to include
+ * WHY AGGREGATION?
+ * The naive approach: fetch playlists, then for each playlist call
+ * PlaylistItem.countDocuments(). If a user has 50 playlists, that's
+ * 51 DB queries — called the N+1 problem. It kills performance.
  *
- * CRITICAL: Never populate without a select in production.
- * Populating without select pulls the entire Video document for every video
- * in the playlist — that's potentially 500 full documents per request.
- * Select only what the UI actually needs.
+ * HOW THIS PIPELINE WORKS:
+ *   $match     → filter to this owner's public playlists (uses index)
+ *   $lookup    → LEFT JOIN with playlistItems collection on _id = playlistId
+ *                (like SQL: SELECT * FROM playlists LEFT JOIN playlistItems ON ...)
+ *   $addFields → compute videoCount from the joined array's size
+ *   $project   → return only the fields needed, drop the joined array from response
+ *   $sort      → newest first
+ *
+ * USAGE:
+ *   const playlists = await Playlist.getPublicPlaylistsWithCount(userId);
+ *   // Each object has: name, description, thumbnail, createdAt, videoCount
  */
-playlistSchema.statics.getPlaylistWithVideos = async function (playlistId) {
-  return this.findById(playlistId).populate({
-    path: "videos",
-    select: "title thumbnail duration views createdAt owner",
-    // You can chain nested populates if needed:
-    // populate: { path: "owner", select: "username avatar" }
-  });
+playlistSchema.statics.getPublicPlaylistsWithCount = async function (ownerId) {
+  return this.aggregate([
+    {
+      $match: {
+        owner: new mongoose.Types.ObjectId(ownerId),
+        visibility: "public",
+      },
+    },
+    {
+      $lookup: {
+        from: "playlistitems", // MongoDB collection name (auto-lowercased + pluralized)
+        localField: "_id",
+        foreignField: "playlistId",
+        as: "itemDocs",
+      },
+    },
+    {
+      $addFields: {
+        videoCount: { $size: "$itemDocs" },
+      },
+    },
+    {
+      $project: {
+        name: 1,
+        description: 1,
+        thumbnail: 1,
+        createdAt: 1,
+        videoCount: 1,
+      },
+    },
+    { $sort: { createdAt: -1 } },
+  ]);
 };
 
 // ─────────────────────────────────────────────
-// MIDDLEWARE (pre/post hooks)
+// HOOKS
 // ─────────────────────────────────────────────
 
 /**
- * PRE-SAVE HOOK: Auto-set thumbnail from first video
+ * PRE findOneAndDelete — Cascade delete PlaylistItems
  *
- * If no explicit thumbnail is set, this hook fires before every save
- * and sets a placeholder. In production, you'd resolve the actual
- * video's thumbnail URL here (requires a Video lookup or passing it in).
+ * CRITICAL: When a playlist is deleted, all its PlaylistItem rows MUST be deleted too.
+ * MongoDB has no foreign key constraints — orphaned PlaylistItem documents
+ * will pile up silently and waste storage/corrupt future counts.
  *
- * Hooks are the Mongoose equivalent of database triggers.
- * Use them for cross-cutting concerns: audit logs, derived fields,
- * cascading updates. Do NOT put business logic here — keep hooks lean.
+ * This hook fires before findOneAndDelete() runs.
+ * this.getQuery()["_id"] gives you the playlist ID being deleted.
  *
- * "next()" must be called or the save operation hangs indefinitely.
- */
-playlistSchema.pre("save", function (next) {
-  // If thumbnail is missing and there are videos, flag for controller to resolve
-  if (!this.thumbnail && this.videos.length > 0) {
-    // Actual thumbnail resolution (fetching from Video collection) should be done
-    // in the service/controller layer to avoid async complexity inside hooks.
-    // Here we just leave it empty — controller decides.
-  }
-  next();
-});
-
-/**
- * PRE findOneAndDelete HOOK: Cleanup
- *
- * When a playlist is deleted, you may want to perform cleanup
- * (e.g., remove this playlist ref from User's savedPlaylists array).
- *
- * This is where you'd trigger that cascade. For now it's a placeholder
- * showing WHERE to put such logic — never scatter cleanup across controllers.
+ * IMPORTANT: This does NOT fire for deleteMany() or Model.remove().
+ * If you ever bulk-delete playlists (e.g., when a user account is deleted),
+ * you must handle PlaylistItem cleanup separately in that operation.
  */
 playlistSchema.pre("findOneAndDelete", async function (next) {
-  // const playlistId = this.getQuery()["_id"];
-  // await User.updateMany({}, { $pull: { savedPlaylists: playlistId } });
+  const playlistId = this.getQuery()["_id"];
+  const PlaylistItem = mongoose.model("PlaylistItem");
+  await PlaylistItem.deleteMany({ playlistId });
   next();
 });
 
