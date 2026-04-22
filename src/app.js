@@ -57,6 +57,8 @@ app.use("/api/v1/likes", likeRouter);
 import SubscriptionRouter from "./routes/Subscription.routes.js";
 app.use("/api/v1/Subscription", SubscriptionRouter);
 
+import PlaylistRouter from "./routes/playlist.route.js";
+app.use("api/v1/Playlist", PlaylistRouter);
 // import watchHistoryRouter from "./routes/watchHistory.route.js";
 // app.use("/api/v1/watch-history", watchHistoryRouter);
 
