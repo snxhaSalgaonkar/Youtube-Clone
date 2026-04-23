@@ -9,10 +9,11 @@ import {
   getUserPlaylists,
   getPlaylistVideos,
 } from "../controllers/playlist.controller.js";
-const router = Router();
+
 import { verifyJWT } from "../middlewares/auth.middleware.js";
 import { checkPlaylistVisibility } from "../middlewares/Checkplaylistvisibility.middleware.js";
 
+const router = Router();
 // Get all playlists of a user
 router.get("/user/:userId", getUserPlaylists);
 

@@ -57,14 +57,21 @@ const rawUploadRateLimiter = rateLimit({
   // Skip rate limiting for admin users (identified after JWT decode)
   skip: (req) => {
     const isAdmin = req.user?.role === "admin";
-    console.log("📊 Rate limiter check - User:", req.user?.email, "IsAdmin:", isAdmin);
+    console.log(
+      "📊 Rate limiter check - User:",
+      req.user?.email,
+      "IsAdmin:",
+      isAdmin,
+    );
     return isAdmin;
   },
 });
 
 // Wrapper to log rate limiter flow
 export const uploadRateLimiter = (req, res, next) => {
-  console.log("*******************upload rateLimiter called from rateLimiter.M********** ")
+  console.log(
+    "*******************upload rateLimiter called from rateLimiter.M********** ",
+  );
   console.log("🚦 uploadRateLimiter: Checking rate limits...");
   rawUploadRateLimiter(req, res, (err) => {
     if (!err) {
@@ -83,18 +90,28 @@ export const uploadRateLimiter = (req, res, next) => {
  * 200 requests per 15 minutes = ~13 requests/minute = normal browsing.
  * Scrapers and bots typically hit hundreds per second.
  */
-export const generalRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res, next) => {
-    next(new ApiError(429, "Too many requests. Please slow down."));
-  },
-});
+// export const generalRateLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000, // 15 minutes
+//   max: 200,
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   handler: (req, res, next) => {
+//     next(new ApiError(429, "Too many requests. Please slow down."));
+//   },
+// });
 
 // ─── SEARCH RATE LIMITER ──────────────────────────────────────────────────────
-
+export const generalRateLimiter = (options = {}) => {
+  return rateLimit({
+    windowMs: options.windowMs || 15 * 60 * 1000,
+    max: options.max || 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res, next) => {
+      next(new ApiError(429, "Too many requests. Please slow down."));
+    },
+  });
+};
 /**
  * Search queries hit text indexes and can be expensive under load.
  * Separate limiter allows you to tune it independently.

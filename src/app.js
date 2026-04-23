@@ -58,7 +58,10 @@ import SubscriptionRouter from "./routes/Subscription.routes.js";
 app.use("/api/v1/Subscription", SubscriptionRouter);
 
 import PlaylistRouter from "./routes/playlist.route.js";
-app.use("api/v1/Playlist", PlaylistRouter);
+app.use("/api/v1/playlists", PlaylistRouter);
+
+import VideoViews from "./routes/videoviews.routes.js";
+app.use("api/v1/VideoViews", VideoViews);
 // import watchHistoryRouter from "./routes/watchHistory.route.js";
 // app.use("/api/v1/watch-history", watchHistoryRouter);
 
