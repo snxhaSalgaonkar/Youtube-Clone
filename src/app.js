@@ -61,9 +61,10 @@ import PlaylistRouter from "./routes/playlist.route.js";
 app.use("/api/v1/playlists", PlaylistRouter);
 
 import VideoViews from "./routes/videoviews.routes.js";
-app.use("api/v1/VideoViews", VideoViews);
-// import watchHistoryRouter from "./routes/watchHistory.route.js";
-// app.use("/api/v1/watch-history", watchHistoryRouter);
+app.use("/api/v1/VideoViews", VideoViews);
+
+import watchHistoryRouter from "./routes/watchHistory.route.js";
+app.use("/api/v1/watch-history", watchHistoryRouter);
 
 import { globalErrorHandler } from "./middlewares/Errorhandler.middlewar.js";
 app.use(globalErrorHandler);

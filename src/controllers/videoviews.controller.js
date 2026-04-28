@@ -24,6 +24,8 @@ import { hashIP, deduplicateView } from "../utils/videoViews.utils.js";
  * Solution: Wrap every async controller in try/catch and call next(err),
  *           or use an asyncHandler wrapper utility.
  */
+import { Video } from "../models/video.model.js";
+import { addToWatchHistory } from "../utils/watchHistoryUtils.js";
 export async function recordView(req, res, next) {
   try {
     const { videoId } = req.params;
@@ -31,6 +33,17 @@ export async function recordView(req, res, next) {
     // Step 1: Validate the videoId is a proper MongoDB ObjectId
     if (!mongoose.isValidObjectId(videoId)) {
       return res.status(400).json({ message: "Invalid video ID format." });
+    }
+    // ✅ Step 2: Check if video exists AND is published
+    const video = await Video.findById(videoId).select("isPublished");
+    if (!video) {
+      return res.status(404).json({ message: "Video not found." });
+    }
+
+    if (!video.isPublished) {
+      return res.status(403).json({
+        message: "This video is not published yet.",
+      });
     }
 
     // Step 2: Get the real client IP
@@ -74,6 +87,10 @@ export async function recordView(req, res, next) {
       userId,
       ipHash,
     });
+
+    if (userId) {
+      await addToWatchHistory(userId, videoId, 0, 0);
+    }
 
     return res.status(201).json({
       message: "View recorded successfully.",
