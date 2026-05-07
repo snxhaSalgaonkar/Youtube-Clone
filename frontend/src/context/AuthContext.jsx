@@ -6,17 +6,28 @@ import api from "@/lib/api";
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser]       = useState(null);  // null = not logged in
-  const [loading, setLoading] = useState(true);  // true = still checking
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // On every page load/refresh, check if the user's cookie is still valid
-    // This is what keeps the user "logged in" across browser refreshes
-    api.get("/users/current-user")
-      .then((res) => setUser(res.data.data))
-      .catch(() => setUser(null)) // cookie missing or expired → treat as logged out
-      .finally(() => setLoading(false));
-  }, []);
+    let cancelled = false; // prevents state update if component unmounts
+
+    api
+      .get("/users/current-user")
+      .then((res) => {
+        if (!cancelled) setUser(res.data.data);
+      })
+      .catch(() => {
+        if (!cancelled) setUser(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    }; // cleanup on unmount
+  }, []); // ← empty array = runs ONCE on mount, never again
 
   const login = (userData) => setUser(userData);
 
